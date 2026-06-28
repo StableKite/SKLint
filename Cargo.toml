@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/sklint-core",
+    "crates/sklint-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.38"
+edition = "2021"
+license = "MIT"
+authors = ["StableKite <stablekite@stablekite.com>"]
+homepage = "https://stablekite.com"
+repository = "https://stablekite.com"

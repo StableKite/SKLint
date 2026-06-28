@@ -1,0 +1,10 @@
+[tool.sklint]
+strict = false
+select = []
+ignore = []
+
+[tool.ruff.lint]
+# Treat SKLint suppression codes as external Ruff-compatible noqa codes.
+# This prevents Ruff from showing "SKxxx: Rule not found" in noqa hovers
+# and from removing SKLint suppressions as unknown external codes.
+external = ["SK"]

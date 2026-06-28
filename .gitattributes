@@ -1,0 +1,17 @@
+# Keep repository line endings stable on Windows.
+* text=auto eol=lf
+
+# Binary artifacts
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.vsix binary
+*.gz binary
+*.tar binary
+
+# Shell-specific overrides, still stored as LF to avoid CRLF churn.
+*.ps1 text eol=lf
+*.sh text eol=lf

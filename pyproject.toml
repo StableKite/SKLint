@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sklint"
+version = "0.1.38"
+description = "StableKite Python linter, formatter and static analyzer powered by Rust"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+  { name = "StableKite", email = "stablekite@stablekite.com" },
+]
+maintainers = [
+  { name = "StableKite", email = "stablekite@stablekite.com" },
+]
+keywords = ["lint", "linter", "formatter", "static-analysis", "python", "rust"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://stablekite.com"
+Documentation = "https://stablekite.com"
+Repository = "https://stablekite.com"
+
+[project.scripts]
+sklint = "sklint.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+packages = ["sklint"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+sklint = ["bin/*"]
+
+[tool.ruff.lint]
+external = ["SK"]

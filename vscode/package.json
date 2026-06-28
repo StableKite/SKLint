@@ -1,0 +1,105 @@
+{
+  "name": "sklint",
+  "displayName": "SKLint",
+  "description": "StableKite Python linter and static analyzer",
+  "version": "0.1.38",
+  "publisher": "stablekite",
+  "author": {
+    "name": "StableKite",
+    "email": "stablekite@stablekite.com",
+    "url": "https://stablekite.com"
+  },
+  "homepage": "https://stablekite.com",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "SKLint",
+      "properties": {
+        "sklint.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the sklint executable. Empty value auto-detects the bundled binary, workspace target/release or target/debug, virtual environments and PATH. Invalid absolute paths are ignored."
+        },
+        "sklint.strict": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fallback strict mode. pyproject.toml has priority when present."
+        },
+        "sklint.select": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Fallback Ruff-like rule selectors, e.g. SK101. pyproject.toml has priority when present."
+        },
+        "sklint.ignore": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Fallback Ruff-like ignore selectors, e.g. SK001. pyproject.toml has priority when present."
+        },
+        "sklint.run": {
+          "type": "string",
+          "enum": [
+            "onType",
+            "onSave"
+          ],
+          "default": "onType",
+          "description": "Run diagnostics while editing or only on save. Default is runtime/onType."
+        },
+        "sklint.formatting.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable SKLint as a VSCode document formatter. Disabled by default; when enabled it participates like other formatters."
+        },
+        "sklint.pyrightAware.filterDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "For SK701/SK702 in VSCode, suppress SKLint diagnostics that overlap Pylance/Pyright diagnostics. These rules target dynamic attribute cases that Pyright leaves clean."
+        },
+        "sklint.pyrightAware.requireMissingSemanticToken": {
+          "type": "boolean",
+          "default": true,
+          "description": "For SK701/SK702 in VSCode, keep the diagnostic only when no semantic token covers the attribute. Disable if your semantic token provider is unavailable."
+        },
+        "sklint.path": {
+          "type": "string",
+          "default": "",
+          "description": "Deprecated alias for sklint.executablePath. Prefer leaving it empty and letting SKLint auto-detect the CLI."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "sklint.fixAll",
+        "title": "SKLint: Fix All Safe Diagnostics"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && python ../scripts/package-vscode.py",
+    "clean": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ]
+}
