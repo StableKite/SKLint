@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p sklint
+
+BIN="$ROOT/target/debug/sklint"
+"$BIN" --version
+"$BIN" check examples/good.py
+if "$BIN" check examples; then
+  echo "expected diagnostics for examples/bad.py" >&2
+  exit 1
+fi
+if "$BIN" check --format json examples/bad.py; then
+  echo "expected JSON diagnostics for examples/bad.py" >&2
+  exit 1
+fi
+if "$BIN" format --check examples/bad.py; then
+  echo "expected format --check to report changes for examples/bad.py" >&2
+  exit 1
+fi
+
+PYTHON_BIN="${PYTHON:-python3}"
+
+JSON_FIX_DIR="$(mktemp -d)"
+echo 'value=1' > "$JSON_FIX_DIR/case.py"
+"$BIN" check --fix --format json "$JSON_FIX_DIR" \
+  > "$JSON_FIX_DIR/stdout.json" \
+  2> "$JSON_FIX_DIR/stderr.log"
+"$PYTHON_BIN" -c 'import json, pathlib, sys; json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); assert "formatted" in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")' \
+  "$JSON_FIX_DIR/stdout.json" "$JSON_FIX_DIR/stderr.log"
+SMOKE_DIR="$(mktemp -d)"
+"$PYTHON_BIN" -m venv "$SMOKE_DIR/venv"
+"$SMOKE_DIR/venv/bin/python" -m pip install --upgrade pip wheel >/dev/null
+"$SMOKE_DIR/venv/bin/python" -m pip wheel . -w "$SMOKE_DIR/wheelhouse" --no-deps
+WHEEL="$(ls -t "$SMOKE_DIR"/wheelhouse/sklint-*.whl | head -n 1)"
+"$SMOKE_DIR/venv/bin/python" -m pip install --force-reinstall "$WHEEL"
+"$SMOKE_DIR/venv/bin/sklint" --version
+"$SMOKE_DIR/venv/bin/python" -m sklint --version
+"$SMOKE_DIR/venv/bin/sklint" check examples/good.py
+
+(
+  cd vscode
+  npm install
+  npm run compile
+)
+python3 scripts/package-vscode.py >/dev/null
+test -f "dist/sklint-$(python3 - <<'PY'
+import json
+print(json.load(open('vscode/package.json', encoding='utf-8'))['version'])
+PY
+).vsix"
+
+if command -v npx >/dev/null 2>&1; then
+  PROBE="$(mktemp -d)"
+  cat > "$PROBE/pyright_clean_self_dynamic.py" <<'PY'
+class Box:
+    def attach(self) -> None:
+        self.generated = 1
+
+    def read(self) -> int:
+        return self.generated
+PY
+  cat > "$PROBE/pyright_reports_object_dynamic.py" <<'PY'
+class Box:
+    pass
+
+box = Box()
+box.generated = 1
+print(box.generated)
+PY
+  echo '{ "typeCheckingMode": "strict" }' > "$PROBE/pyrightconfig.json"
+  if (cd "$PROBE" && npx --yes pyright --outputjson \
+      pyright_clean_self_dynamic.py pyright_reports_object_dynamic.py \
+      > pyright_probes.json); then
+    echo "expected pyright to report object dynamic attribute access" >&2
+    exit 1
+  fi
+  "$PYTHON_BIN" - "$PROBE/pyright_probes.json" \
+      "$PROBE/pyright_clean_self_dynamic.py" \
+      "$PROBE/pyright_reports_object_dynamic.py" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+clean = pathlib.Path(sys.argv[2]).resolve()
+reported = pathlib.Path(sys.argv[3]).resolve()
+diagnostics = report.get("generalDiagnostics", [])
+assert not any(pathlib.Path(item["file"]).resolve() == clean for item in diagnostics)
+assert any(
+    pathlib.Path(item["file"]).resolve() == reported
+    and item.get("rule") == "reportAttributeAccessIssue"
+    for item in diagnostics
+)
+PY
+fi
+
+echo "release checks passed"

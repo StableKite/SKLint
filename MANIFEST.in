@@ -1,0 +1,17 @@
+include Cargo.toml Cargo.lock LICENSE README.md
+include pyproject.toml setup.py MANIFEST.in
+recursive-include crates *.rs Cargo.toml
+recursive-include docs *.md
+recursive-include python *.py
+recursive-include vscode README.ru.md package.json package-lock.json tsconfig.json
+recursive-include vscode/src *.ts
+recursive-include examples *.py *.pyi *.toml
+recursive-include scripts *.ps1 *.sh *.py
+recursive-exclude target *
+recursive-exclude dist *
+recursive-exclude wheelhouse *
+recursive-exclude vscode/out *
+recursive-exclude vscode/node_modules *
+recursive-exclude .pytest_cache *
+recursive-exclude __pycache__ *
+recursive-exclude .venv *
