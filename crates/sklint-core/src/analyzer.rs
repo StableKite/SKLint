@@ -30,6 +30,11 @@ pub fn analyze(input: AnalysisInput) -> AnalysisReport {
     let mut visible = Vec::new();
 
     for diagnostic in run_rules(&input.path, &input.source, &config) {
+        if diagnostic.code == "SK805" {
+            visible.push(diagnostic);
+            continue;
+        }
+
         let suppression_line = diagnostic.suppression_line.unwrap_or(diagnostic.line);
         let ids = suppressions.suppressing_ids_for(suppression_line, &diagnostic.code, None);
         if ids.is_empty() {
@@ -147,9 +152,207 @@ fn is_cyrillic_lower(ch: char) -> bool {
         && ch.is_lowercase()
 }
 
+fn run_file_wide_suppression_rule(path: &Path, source: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let display_path = path.display().to_string();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            inspect_file_wide_suppression_line(
+                &mut diagnostics,
+                &display_path,
+                idx + 1,
+                lines[idx],
+            );
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    if let Some(end_idx) = module_docstring_end(&lines, idx) {
+        idx = end_idx + 1;
+        while idx < lines.len() {
+            let trimmed = lines[idx].trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                inspect_file_wide_suppression_line(
+                    &mut diagnostics,
+                    &display_path,
+                    idx + 1,
+                    lines[idx],
+                );
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    diagnostics
+}
+
+fn inspect_file_wide_suppression_line(
+    diagnostics: &mut Vec<Diagnostic>,
+    display_path: &str,
+    line_no: usize,
+    line: &str,
+) {
+    let Some(comment_start) = line.find('#') else {
+        return;
+    };
+
+    if !line[..comment_start].trim().is_empty() {
+        return;
+    }
+
+    for segment in hash_comment_segments(&line[comment_start..]) {
+        let Some(kind) = file_wide_suppression_kind(segment) else {
+            continue;
+        };
+        let column = line.chars().take(comment_start).count() + 1;
+        let end_column = line.chars().count() + 1;
+        diagnostics.push(Diagnostic::new(
+            "SK805",
+            format!("File-wide `{kind}` suppression is forbidden in strict mode"),
+            display_path.to_string(),
+            Span::new(line_no, column, line_no, end_column.max(column + 1)),
+            "warning",
+        ));
+    }
+}
+
+fn module_docstring_end(lines: &[&str], start_idx: usize) -> Option<usize> {
+    let first = lines.get(start_idx)?.trim_start();
+    let quote = triple_quote_prefix(first)?;
+    let after_opening = &first[quote.len()..];
+    if after_opening.contains(quote) {
+        return Some(start_idx);
+    }
+    (start_idx + 1..lines.len()).find(|idx| lines[*idx].contains(quote))
+}
+
+fn triple_quote_prefix(trimmed: &str) -> Option<&'static str> {
+    let without_prefix = trimmed
+        .strip_prefix('r')
+        .or_else(|| trimmed.strip_prefix('R'))
+        .or_else(|| trimmed.strip_prefix('u'))
+        .or_else(|| trimmed.strip_prefix('U'))
+        .unwrap_or(trimmed);
+    if without_prefix.starts_with("\"\"\"") {
+        Some("\"\"\"")
+    } else if without_prefix.starts_with("'''") {
+        Some("'''")
+    } else {
+        None
+    }
+}
+
+fn hash_comment_segments(comment: &str) -> Vec<&str> {
+    comment
+        .match_indices('#')
+        .map(|(idx, _)| &comment[idx..])
+        .collect()
+}
+
+fn file_wide_suppression_kind(comment: &str) -> Option<&'static str> {
+    let text = comment.trim_start().strip_prefix('#')?.trim_start();
+    let text = text.split('#').next().unwrap_or(text).trim();
+    let lower = text.to_ascii_lowercase();
+
+    if is_noqa_file_suppression(&lower) {
+        return Some("noqa");
+    }
+    if let Some(body) = lower.strip_prefix("pylint:") {
+        let body = body.trim_start();
+        if starts_directive_name(body, "disable") || starts_directive_name(body, "skip-file") {
+            return Some("pylint");
+        }
+    }
+    if let Some(body) = lower.strip_prefix("pyright:") {
+        let body = body.trim_start();
+        if body.starts_with("ignore") || contains_disabled_pyright_report(body) {
+            return Some("pyright");
+        }
+    }
+    if lower.starts_with("type: ignore") {
+        return Some("type-ignore");
+    }
+    if let Some(body) = lower.strip_prefix("mypy:") {
+        let body = body.trim_start();
+        if body.contains("ignore-errors") || body.contains("disable-error-code") {
+            return Some("mypy");
+        }
+    }
+    if let Some(body) = lower.strip_prefix("pytype:") {
+        let body = body.trim_start();
+        if starts_directive_name(body, "disable") || starts_directive_name(body, "skip-file") {
+            return Some("pytype");
+        }
+    }
+    if lower.starts_with("pyre-ignore-all-errors") {
+        return Some("pyre");
+    }
+    if lower
+        .strip_prefix("isort:")
+        .is_some_and(|body| body.trim_start().starts_with("skip_file"))
+    {
+        return Some("isort");
+    }
+    if let Some(body) = lower.strip_prefix("sklint") {
+        let body = body.trim_start();
+        if let Some(body) = body.strip_prefix(':') {
+            let body = body.trim_start();
+            if starts_directive_name(body, "noqa")
+                || starts_directive_name(body, "ignore")
+                || starts_directive_name(body, "disable")
+            {
+                return Some("sklint");
+            }
+        }
+    }
+
+    None
+}
+
+fn is_noqa_file_suppression(lower: &str) -> bool {
+    starts_directive_name(lower, "noqa")
+        || starts_directive_name(lower, "flake8: noqa")
+        || starts_directive_name(lower, "ruff: noqa")
+}
+
+fn starts_directive_name(text: &str, name: &str) -> bool {
+    if text == name {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix(name) else {
+        return false;
+    };
+    rest.starts_with(':')
+        || rest.starts_with('=')
+        || rest.chars().next().is_some_and(char::is_whitespace)
+}
+
+fn contains_disabled_pyright_report(body: &str) -> bool {
+    body.split(',').any(|part| {
+        let part = part.trim();
+        part.starts_with("report")
+            && (part.ends_with("=false")
+                || part.ends_with("=none")
+                || part.ends_with("=\"none\"")
+                || part.ends_with("='none'"))
+    })
+}
+
 fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let display_path = path.display().to_string();
+
+    if config.strict {
+        diagnostics.extend(run_file_wide_suppression_rule(path, source));
+    }
 
     if config.is_enabled("SK001") {
         let source_lines: Vec<&str> = source.lines().collect();
@@ -336,5 +539,48 @@ mod tests {
     fn strict_rule_can_be_enabled_from_inline_config() {
         let report = analyze(input("# sklint: strict\n# TODO: fix me\n"));
         assert!(report.diagnostics.iter().any(|diag| diag.code == "SK101"));
+    }
+
+    #[test]
+    fn strict_mode_reports_top_level_global_suppressions() {
+        let report = analyze(input(
+            "# sklint: strict\n# pylint: disable=missing-module-docstring\n# ruff: noqa: F401\n# pyright: reportPrivateUsage=false\n# type: ignore\n# mypy: ignore-errors\n# sklint: ignore=SK804\nvalue = 1\n",
+        ));
+        let count = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.code == "SK805")
+            .count();
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn strict_mode_reports_global_suppression_after_module_docstring() {
+        let report = analyze(input(
+            "# sklint: strict\n\"\"\"Описание модуля.\"\"\"\n# flake8: noqa\nfrom x import y\n",
+        ));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK805"));
+    }
+
+    #[test]
+    fn non_strict_mode_does_not_report_global_suppressions() {
+        let report = analyze(input(
+            "# pylint: disable=missing-module-docstring\nvalue = 1\n",
+        ));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK805"));
+    }
+
+    #[test]
+    fn strict_mode_does_not_report_local_line_suppressions() {
+        let report = analyze(input(
+            "# sklint: strict\nvalue=1  # noqa: E225\n# локальный комментарий\n# pyright: strict\n",
+        ));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK805"));
+    }
+
+    #[test]
+    fn strict_mode_global_sklint_noqa_cannot_hide_sk805() {
+        let report = analyze(input("# sklint: strict\n# sklint: noqa\nvalue = 1\n"));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK805"));
     }
 }

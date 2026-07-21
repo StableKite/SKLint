@@ -279,6 +279,8 @@ value = build_value()  # pyright: ignore[reportAny]  # noqa: SK401
 # sklint: noqa: SK601, SK900
 ```
 
+В strict-режиме глобальные подавления в прологе файла запрещены правилом `SK805`. Это касается не только SKLint, но и распространённых директив других анализаторов: `# ruff: noqa`, `# flake8: noqa`, `# pylint: disable=...`, `# pyright: report...=false`, `# type: ignore`, `# mypy: ignore-errors` и аналогичных file-wide suppressions. Локальные подавления на конкретных строках кода остаются допустимыми.
+
 Для блока:
 
 ```python

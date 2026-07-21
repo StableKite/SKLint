@@ -218,6 +218,12 @@ pub const ALL_RULES: &[Rule] = &[
         summary: "Modules with public symbols must define __all__ as a tuple in strict mode",
     },
     Rule {
+        code: "SK805",
+        name: "FileWideSuppression",
+        level: RuleLevel::Strict,
+        summary: "File-wide linter suppressions are forbidden in strict mode",
+    },
+    Rule {
         code: "SK601",
         name: "DocstringLineTooLong",
         level: RuleLevel::Normal,

@@ -488,3 +488,21 @@ Autofix: преобразует `items = []; for x in xs: items.append(expr)` в
 Strict-only. Непустой модуль с публичными символами должен объявлять `__all__` именно как tuple: `__all__ = (...)`, не list.
 
 Autofix: создаёт или переписывает простой `__all__` tuple template.
+
+## SK805 — FileWideSuppression
+
+Strict-only. В начале файла запрещены глобальные подавления предупреждений для всего файла. Правило проверяет пролог файла до первого кода, а также комментарии сразу после модульного докстринга. Локальные подавления на строках кода не запрещаются.
+
+Запрещённые примеры:
+
+```python
+# ruff: noqa
+# flake8: noqa
+# pylint: disable=missing-module-docstring
+# pyright: reportPrivateUsage=false
+# type: ignore
+# mypy: ignore-errors
+# sklint: ignore=SK804
+```
+
+Autofix: отсутствует, потому что удаление глобального подавления может открыть набор реальных диагностик, которые нужно разобрать вручную.

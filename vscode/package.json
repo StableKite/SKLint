@@ -2,7 +2,7 @@
   "name": "sklint",
   "displayName": "SKLint",
   "description": "StableKite Python linter and static analyzer",
-  "version": "0.1.44",
+  "version": "0.1.46",
   "publisher": "stablekite",
   "author": {
     "name": "StableKite",
