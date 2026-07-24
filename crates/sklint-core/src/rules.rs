@@ -69,9 +69,9 @@ pub const ALL_RULES: &[Rule] = &[
     },
     Rule {
         code: "SK306",
-        name: "StandalonePublicObjectBlankLines",
+        name: "StandaloneTopLevelObjectBlankLines",
         level: RuleLevel::Normal,
-        summary: "Standalone public functions and classes must be separated by exactly three blank lines",
+        summary: "Standalone top-level functions and classes must be separated by exactly three blank lines",
     },
     Rule {
         code: "SK307",

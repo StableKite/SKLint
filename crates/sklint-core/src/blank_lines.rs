@@ -1,5 +1,6 @@
 use crate::config::EffectiveConfig;
 use crate::diagnostic::{Diagnostic, Fix, Span};
+use crate::identifier::is_identifier_continue;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,16 +425,24 @@ fn run_top_level_spacing_rules(
             continue;
         }
 
-        if is_public_standalone(left) && is_public_standalone(right) && config.is_enabled("SK306") {
+        if is_standalone_top_level_object(left)
+            && is_standalone_top_level_object(right)
+            && config.is_enabled("SK306")
+        {
             push_blank_diagnostic(
-                    diagnostics,
-                    display_path,
-                    lines,
-                    left.end_nonblank,
-                    right.group_start,
-                    actual,
-                    blank_rule("SK306", "Standalone public functions and classes must be separated by exactly 3 blank lines", "Set 3 blank lines between standalone public objects", 3),
-                );
+                diagnostics,
+                display_path,
+                lines,
+                left.end_nonblank,
+                right.group_start,
+                actual,
+                blank_rule(
+                    "SK306",
+                    "Standalone top-level functions and classes must be separated by exactly 3 blank lines",
+                    "Set 3 blank lines between standalone top-level objects",
+                    3,
+                ),
+            );
         }
     }
 
@@ -539,8 +548,8 @@ fn has_intervening_top_level_statement(lines: &[String], start: usize, end: usiz
     false
 }
 
-fn is_public_standalone(node: &Node) -> bool {
-    matches!(node.kind, NodeKind::Class | NodeKind::Function) && !is_private_name(&node.name)
+fn is_standalone_top_level_object(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Class | NodeKind::Function)
 }
 
 fn is_private_name(name: &str) -> bool {
@@ -561,12 +570,78 @@ fn is_private_helper_for_next(
     if !matches!(right.kind, NodeKind::Class | NodeKind::Function) {
         return false;
     }
+    if is_private_main_entry(right_idx, nodes, source) {
+        return false;
+    }
     let right_text = source_lines_range(source, right.start, right.body_end);
-    if !right_text.contains(&left.name) {
+    if !contains_name_use(&right_text, &left.name) {
         return false;
     }
     let rest = source_lines_range(source, right.body_end + 1, usize::MAX);
-    !rest.contains(&left.name)
+    !contains_name_use(&rest, &left.name)
+}
+
+fn is_private_main_entry(node_idx: usize, nodes: &[Node], source: &str) -> bool {
+    let node = &nodes[node_idx];
+    if node.kind != NodeKind::Function || !is_private_name(&node.name) {
+        return false;
+    }
+    let Some(main) = nodes
+        .iter()
+        .filter(|candidate| candidate.kind == NodeKind::Main)
+        .filter(|candidate| candidate.start > node.body_end)
+        .min_by_key(|candidate| candidate.start)
+    else {
+        return false;
+    };
+    let between = source_lines_range(
+        source,
+        node.body_end + 1,
+        main.group_start.saturating_sub(1),
+    );
+    if has_top_level_code_text(&between) {
+        return false;
+    }
+    let main_text = source_lines_range(source, main.start, main.body_end);
+    contains_name_use(&main_text, &node.name)
+}
+
+fn contains_name_use(source: &str, name: &str) -> bool {
+    source.lines().any(|line| {
+        let code = strip_comment_and_strings(line);
+        contains_word(&code, name)
+    })
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    let mut idx = 0usize;
+    while let Some(pos) = text[idx..].find(word) {
+        let start = idx + pos;
+        let end = start + word.len();
+        let before = char_before(text, start);
+        let after = text[end..].chars().next();
+        if before.is_none_or(|ch| !is_identifier_continue(ch))
+            && after.is_none_or(|ch| !is_identifier_continue(ch))
+        {
+            return true;
+        }
+        idx = end;
+    }
+    false
+}
+
+fn char_before(text: &str, idx: usize) -> Option<char> {
+    text.get(..idx)?.chars().next_back()
+}
+
+fn has_top_level_code_text(source: &str) -> bool {
+    source.lines().any(|line| {
+        indent_width(line) == 0 && {
+            let code = strip_comment_and_strings(line);
+            let trimmed = code.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('@')
+        }
+    })
 }
 
 fn source_lines_range(source: &str, start: usize, end: usize) -> String {
@@ -1611,5 +1686,61 @@ class Factory:
 
     return Inner"#;
         assert!(!codes(source).contains(&"SK301".to_string()));
+    }
+
+    #[test]
+    fn private_main_entry_is_a_standalone_top_level_object() {
+        let source = r#"def _helper():
+    return 1
+
+
+def _demo():
+    return _helper()
+
+
+
+if __name__ == "__main__":
+    _demo()"#;
+        let found = codes(source);
+        assert!(found.contains(&"SK306".to_string()));
+        assert!(!found.contains(&"SK310".to_string()));
+    }
+
+    #[test]
+    fn private_top_level_objects_are_standalone_when_not_helpers() {
+        let source = r#"def _first():
+    return 1
+
+
+def _second():
+    return 2"#;
+        let found = codes(source);
+        assert!(found.contains(&"SK306".to_string()));
+        assert!(!found.contains(&"SK310".to_string()));
+    }
+
+    #[test]
+    fn formatter_separates_private_main_entry_with_three_blank_lines() {
+        let source = r#"def _helper():
+    return 1
+
+
+def _demo():
+    return _helper()
+
+
+
+if __name__ == "__main__":
+    _demo()"#;
+        let report = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            VscodeConfig::default(),
+        );
+        assert!(report.source.contains("return 1
+
+
+
+def _demo"));
     }
 }
