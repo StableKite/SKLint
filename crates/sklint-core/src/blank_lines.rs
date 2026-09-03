@@ -1737,10 +1737,12 @@ if __name__ == "__main__":
             source.to_string(),
             VscodeConfig::default(),
         );
-        assert!(report.source.contains("return 1
+        assert!(report.source.contains(
+            "return 1
 
 
 
-def _demo"));
+def _demo"
+        ));
     }
 }

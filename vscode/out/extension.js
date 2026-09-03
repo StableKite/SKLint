@@ -39,6 +39,7 @@ const RU_DIAGNOSTICS = {
     SK505: 'Объявления должны располагаться выше первого использования',
     SK509: '__new__, __init__ и __post_init__ должны идти перед обычными методами класса именно в этом порядке',
     SK506: 'Блоки try, except и finally запрещены в горячем runtime-коде',
+    SK510: 'contextlib.suppress запрещён в strict-режиме: он скрывает исключительный путь так же, как try/except',
     SK507: 'raise разрешён только в lifecycle-методах и их приватных helper-методах',
     SK508: 'from __future__ import annotations запрещён',
     SK801: 'Промежуточную переменную с одним использованием нужно свернуть в строгом режиме',
@@ -47,7 +48,7 @@ const RU_DIAGNOSTICS = {
     SK804: 'Модуль с публичными символами должен объявлять __all__ как tuple в строгом режиме',
     SK805: 'Глобальные подавления предупреждений для всего файла запрещены в строгом режиме',
     SK601: 'Строка докстринга длиннее 72 символов',
-    SK602: 'Докстринг должен быть оформлен только в Google style',
+    SK602: 'Докстринг должен использовать настроенный стиль документации',
     SK603: 'Последняя строка секции докстринга не должна заканчиваться точкой',
     SK604: 'Докстринг выглядит полностью английским и не содержит кириллицы',
     SK605: 'Описание должно быть сформулировано как процесс или состояние, а не как действие-глагол',
@@ -621,6 +622,7 @@ function resolveDocsPath() {
 function vscodeConfigArgs(uri) {
     const config = vscode.workspace.getConfiguration('sklint', uri);
     const args = ['--vscode-strict', String(config.get('strict', false))];
+    args.push('--vscode-docstring-style', String(config.get('formatting.docstringStyle', 'google')));
     const select = config.get('select', []);
     const ignore = config.get('ignore', []);
     if (Array.isArray(select) && select.length > 0) {

@@ -8,3 +8,7 @@ homepage.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+rustpython-parser = "0.4.0"
+rustpython-ast = { version = "0.4.0", features = ["unparse"] }

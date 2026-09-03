@@ -64,6 +64,9 @@ pub fn run_syntax_rules(path: &Path, source: &str, config: &EffectiveConfig) -> 
     if config.is_enabled("SK506") {
         run_try_blocks(&display_path, &lines, &mut diagnostics);
     }
+    if config.is_enabled("SK510") {
+        run_contextlib_suppress(&display_path, &lines, &mut diagnostics);
+    }
     if config.is_enabled("SK507") {
         run_raise_hot_path(&display_path, &lines, &defs, &mut diagnostics);
     }
@@ -306,8 +309,10 @@ fn run_print_statement(display_path: &str, lines: &[LineInfo], diagnostics: &mut
         while let Some(pos) = line.code[start..].find("print") {
             let byte = start + pos;
             let before = char_before(&line.code, byte);
-            let after = line.code[byte + "print".len()..].chars().next();
-            if before.is_none_or(|ch| !is_identifier_continue(ch)) && matches!(after, Some('(')) {
+            let after = line.code[byte + "print".len()..].trim_start();
+            if before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+                && after.starts_with('(')
+            {
                 let col = byte_to_column(&line.text, byte);
                 diagnostics.push(Diagnostic::new(
                     "SK201",
@@ -1142,6 +1147,165 @@ fn run_try_blocks(display_path: &str, lines: &[LineInfo], diagnostics: &mut Vec<
             ));
         }
     }
+}
+
+fn run_contextlib_suppress(
+    display_path: &str,
+    lines: &[LineInfo],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let (function_aliases, module_aliases) = contextlib_suppress_aliases(lines);
+    if function_aliases.is_empty() && module_aliases.is_empty() {
+        return;
+    }
+
+    for line in lines {
+        let trimmed = line.code.trim_start();
+        if trimmed.starts_with("from contextlib import ")
+            || trimmed.starts_with("import contextlib")
+        {
+            continue;
+        }
+
+        for alias in &function_aliases {
+            if let Some(byte) = find_bare_call(&line.code, alias) {
+                push_contextlib_suppress_diagnostic(
+                    display_path,
+                    line,
+                    byte,
+                    alias.len(),
+                    diagnostics,
+                );
+                break;
+            }
+        }
+
+        for module_alias in &module_aliases {
+            let qualified = format!("{module_alias}.suppress");
+            if let Some(byte) = find_qualified_call(&line.code, &qualified) {
+                push_contextlib_suppress_diagnostic(
+                    display_path,
+                    line,
+                    byte,
+                    qualified.len(),
+                    diagnostics,
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn contextlib_suppress_aliases(lines: &[LineInfo]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut function_aliases = BTreeSet::new();
+    let mut module_aliases = BTreeSet::new();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        if lines[idx].code.trim().is_empty() {
+            idx += 1;
+            continue;
+        }
+        let end = logical_statement_end(lines, idx);
+        let statement = lines[idx..=end]
+            .iter()
+            .map(|line| line.code.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let normalized = statement.replace(['(', ')'], " ");
+        let trimmed = normalized.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("from contextlib import ") {
+            for imported in rest
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+            {
+                let mut parts = imported.split_whitespace();
+                let name = parts.next().unwrap_or("");
+                if name != "suppress" && name != "*" {
+                    continue;
+                }
+                let alias = match (parts.next(), parts.next()) {
+                    (Some("as"), Some(alias)) if name == "suppress" => alias,
+                    _ => "suppress",
+                };
+                function_aliases.insert(alias.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            for imported in rest
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+            {
+                let mut parts = imported.split_whitespace();
+                let name = parts.next().unwrap_or("");
+                if name != "contextlib" {
+                    continue;
+                }
+                let alias = match (parts.next(), parts.next()) {
+                    (Some("as"), Some(alias)) => alias,
+                    _ => "contextlib",
+                };
+                module_aliases.insert(alias.to_string());
+            }
+        }
+
+        idx = end + 1;
+    }
+
+    (function_aliases, module_aliases)
+}
+
+fn find_bare_call(code: &str, name: &str) -> Option<usize> {
+    let mut start = 0usize;
+    while let Some(pos) = code[start..].find(name) {
+        let byte = start + pos;
+        let before = char_before(code, byte);
+        let after_name = byte + name.len();
+        let after = code[after_name..].trim_start();
+        if before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && after.starts_with('(')
+            && !code[..byte].trim_end().ends_with("def")
+        {
+            return Some(byte);
+        }
+        start = after_name;
+    }
+    None
+}
+
+fn find_qualified_call(code: &str, name: &str) -> Option<usize> {
+    let mut start = 0usize;
+    while let Some(pos) = code[start..].find(name) {
+        let byte = start + pos;
+        let before = char_before(code, byte);
+        let after_name = byte + name.len();
+        if before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && code[after_name..].trim_start().starts_with('(')
+        {
+            return Some(byte);
+        }
+        start = after_name;
+    }
+    None
+}
+
+fn push_contextlib_suppress_diagnostic(
+    display_path: &str,
+    line: &LineInfo,
+    byte: usize,
+    len: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let col = byte_to_column(&line.text, byte);
+    diagnostics.push(Diagnostic::new(
+        "SK510",
+        "contextlib.suppress is forbidden in strict mode because it hides exceptional control flow like try/except",
+        display_path,
+        Span::new(line.no, col, line.no, col + len),
+        "warning",
+    ));
 }
 
 fn run_raise_hot_path(
@@ -2120,6 +2284,41 @@ mod tests {
     fn allows_print_inside_main_guard() {
         let found = codes("if __name__ == \"__main__\":\n    print('ok')\n", false);
         assert!(!found.contains(&"SK201".to_string()));
+    }
+
+    #[test]
+    fn sk201_does_not_report_print_attributes() {
+        let found = codes("logger.print('debug')\n", false);
+        assert!(!found.contains(&"SK201".to_string()));
+    }
+
+    #[test]
+    fn sk201_reports_print_with_space_before_parenthesis() {
+        let found = codes("print ('debug')\n", false);
+        assert!(found.contains(&"SK201".to_string()));
+    }
+
+    #[test]
+    fn sk510_catches_contextlib_suppress_only_in_strict_mode() {
+        let source = "from contextlib import suppress\nwith suppress(ValueError):\n    pass\n";
+        assert!(!codes(source, false).contains(&"SK510".to_string()));
+        assert!(codes(source, true).contains(&"SK510".to_string()));
+    }
+
+    #[test]
+    fn sk510_catches_contextlib_module_and_import_aliases() {
+        let module_alias = "import contextlib as ctx\nwith ctx.suppress(OSError):\n    pass\n";
+        let function_alias =
+            "from contextlib import suppress as ignore_error\nwith ignore_error(OSError):\n    pass\n";
+        assert!(codes(module_alias, true).contains(&"SK510".to_string()));
+        assert!(codes(function_alias, true).contains(&"SK510".to_string()));
+    }
+
+    #[test]
+    fn sk510_does_not_report_unrelated_local_suppress_function() {
+        let source =
+            "def suppress(error):\n    return error\n\n\ndef f():\n    suppress(ValueError)\n";
+        assert!(!codes(source, true).contains(&"SK510".to_string()));
     }
 
     #[test]

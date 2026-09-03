@@ -37,7 +37,7 @@ CLI-команда `sklint format` и VSCode formatter используют од
 **Autofix:** нет.
 
 Запрещает вызовы `print(...)` вне блока `if __name__ == "__main__":`.
-Правило является проектным вариантом Ruff `T201`: вывод CLI допускается только в явной точке входа, а production/runtime-код должен использовать другой механизм вывода или логирования.
+Правило является проектным вариантом Ruff `T201`: вывод CLI допускается только в явной точке входа, а production/runtime-код должен использовать другой механизм вывода или логирования. Локально правило можно подавить как внутренним кодом `# noqa: SK201`, так и совместимым с Ruff кодом `# noqa: T201`. Alias `T201` относится только к `SK201` и не включает другие Ruff-коды в пространство правил SKLint.
 
 ## SK211 — CommentCyrillicSentenceCapitalized
 
@@ -160,12 +160,12 @@ CLI-команда `sklint format` и VSCode formatter используют од
 
 Строка докстринга не должна превышать 72 символа от начала строки, включая тройные кавычки, но исключая пробелы в конце строки и перенос строки. В VSCode подчёркивается только хвост строки после 72-го символа.
 
-## SK602 — DocstringGoogleStyleOnly
+## SK602 — DocstringConfiguredStyle
 
 **Уровень:** обычный.  
-**Autofix:** нет.
+**Autofix:** структурный formatter приводит создаваемые/добавляемые секции к настроенному стилю; произвольный существующий докстринг целиком автоматически не переписывается.
 
-Докстринги должны быть оформлены только в Google style. reST/Numpy/Javadoc-признаки вроде `:param`, `@param`, `Parameters` не принимаются.
+Стиль докстринга должен совпадать с effective style SKLint. По умолчанию formatter и продукт используют Google style; через `formatter-docstring-style` / `sklint.formatting.docstringStyle` либо pydoclint `style` можно выбрать `google`, `numpy` или `sphinx`. `SK602`, pydoclint-порт и formatter используют один и тот же effective style, поэтому они не должны требовать взаимоисключающие форматы.
 
 ## SK603 — DocstringSectionTrailingPeriod
 
@@ -388,11 +388,13 @@ class Common(BaseConcConfig):
 ## SK900 — UnusedSuppression
 
 **Уровень:** обычный.  
-**Autofix:** пока нет.
+**Autofix:** безопасный selector-level fix.
 
-Сообщает о подавлениях SKLint, которые больше не подавляют актуальные предупреждения. Bare `# noqa` не считается подавлением SKLint, потому что SKLint реагирует только на явные `SKxxx` selectors.
+Сообщает о подавлениях SKLint, которые больше не подавляют актуальные предупреждения. Использование считается отдельно для каждого selector-а; при перекрытии broad/exact suppressions ответственность получает наиболее локальное и специфичное подавление. Formatter удаляет только лишний SKLint selector/segment и сохраняет соседние Ruff/Flake8-коды и обычные комментарии. Поддерживаются `noqa`, `sklint: ignore/disable`, catch-all suppressions, `enable`, prefix selectors и алиасы `DOCxxx ↔ SKDxxx`. Bare `# noqa` без явного SKLint selector-а не считается подавлением SKLint.
 
 ## SK401 — AssignmentOperatorSpacing
+
+**Уровень:** обычный.  
 
 Оператор присваивания `=` должен иметь пробелы с обеих сторон. Исключения: `==`, `!=`, `<=`, `>=`, `:=` и случай, когда `=` стоит последним значимым символом строки перед переносом.
 
@@ -404,13 +406,17 @@ Autofix: безопасно нормализует пробелы вокруг `
 
 ## SK403 — MultilineBracketItemLayout
 
+**Уровень:** обычный.  
+
 Если скобочная конструкция раскрыта на несколько строк, элементы внутри должны идти с отступом и по одному на строку. Однострочные вызовы вида `Point(x, y)` не затрагиваются; правило срабатывает только для раскрытых конструкций вида `Point(
     x, y
 )`. Подчёркивается первый лишний элемент на строке, например `y`.
 
-Autofix: разделяет простые элементы по строкам.
+Autofix: доступна только unsafe/manual suggestion для простых случаев; bulk formatter её не применяет автоматически.
 
 ## SK404 — TrailingComma
+
+**Уровень:** обычный.  
 
 Висящая запятая — это запятая, после которой нет следующего элемента и сразу закрывается `)`, `]` или `}`. Обычные многострочные сигнатуры, import-блоки и одноэлементные tuple-литералы вида `(value,)` не нарушают это правило.
 
@@ -418,17 +424,23 @@ Autofix: удаляет висящую запятую.
 
 ## SK502 — FromImportOnly
 
+**Уровень:** обычный.  
+
 Импорты должны быть выполнены через форму `from module import name`. Исключение: `import sys`, если в файле используется `sys.platform` или `sys.version_info` для runtime-ветвления.
 
-Autofix: для простых случаев переписывает `import module` в `from module import used_name` и убирает префикс модуля у использований.
+Autofix: отсутствует — безопасно вывести требуемый `from ... import ...` для всех вариантов импорта и областей видимости нельзя.
 
 ## SK503 — PreferSysPlatform
 
+**Уровень:** обычный.  
+
 `os.name` менее информативен, чем `sys.platform`. Для проверок платформы используйте `sys.platform`.
 
-Autofix: заменяет `os.name` на `sys.platform`.
+Autofix: отсутствует — замена требует согласованного изменения/import-а `sys` и проверки shadowing.
 
 ## SK504 — DirectSysPlatformImport
+
+**Уровень:** обычный.  
 
 `from sys import platform` запрещён для проверок платформы. Pylance/Pyright лучше понимает ветвления в форме `import sys` + `if sys.platform ...`.
 
@@ -436,11 +448,15 @@ Autofix: переписывает импорт и условия `if platform ..
 
 ## SK505 — DefinitionOrder
 
+**Уровень:** обычный.  
+
 Функции, классы и методы должны быть объявлены выше мест, где они используются. Порядок специальных методов `__new__` / `__init__` / `__post_init__` проверяется отдельным правилом `SK509`.
 
 Autofix: поддерживается встроенным форматировщиком. Форматировщик переставляет цельные блоки `def`/`class` с декораторами выше первого использования, если границы блока можно определить безопасно.
 
 ## SK509 — SpecialMethodOrder
+
+**Уровень:** обычный.  
 
 `__new__`, `__init__` и `__post_init__` должны идти перед обычными методами именно в таком порядке. `__new__` может отсутствовать, но если он есть, он должен идти раньше `__init__` и `__post_init__`.
 
@@ -448,11 +464,22 @@ Autofix: поддерживается встроенным форматиров�
 
 ## SK506 — TryExceptFinallyForbidden
 
+**Уровень:** обычный.  
+
 `try`, `except` и `finally` запрещены в hot runtime-коде проекта, так как такая структура часто уводит управление в исключительный путь и усложняет оптимизацию.
 
 Autofix: отсутствует.
 
+## SK510 — ContextlibSuppressForbidden
+
+**Уровень:** strict-only.  
+**Autofix:** нет.
+
+В строгом режиме запрещает `contextlib.suppress(...)`, включая `from contextlib import suppress`, алиасы импорта и форму `import contextlib as ...`. `suppress` скрывает исключительный путь управления по той же причине, по которой `SK506` предупреждает о `try`/`except`: исключение не должно бесшумно превращаться в обычное продолжение runtime-кода.
+
 ## SK507 — RaiseHotPath
+
+**Уровень:** обычный.  
 
 `raise` разрешён только в методах `__init__`, `__post_init__`, `run`, `close`, а также в приватных helper-методах, которые используются только этими методами текущего класса.
 
@@ -461,11 +488,15 @@ Autofix: отсутствует.
 
 ## SK508 — FutureAnnotationsImport
 
+**Уровень:** обычный.  
+
 `from __future__ import annotations` запрещён. Проект ориентируется на современный runtime и не должен менять поведение аннотаций через future-import.
 
 Autofix: удаляет строку `from __future__ import annotations`, если она содержит только этот импорт.
 
 ## SK801 — InlineSingleUseVariable
+
+**Уровень:** strict-only.  
 
 Strict-only. Промежуточная переменная, которая используется ровно один раз во всём следующем логическом statement и может быть безопасно подставлена, должна быть свернута. При подсчёте учитываются многострочные выражения и дополнительные упоминания внутри f-string; при неоднозначности правило не предлагает автоматическое исправление.
 
@@ -473,11 +504,15 @@ Autofix: удаляет простое присваивание и подста�
 
 ## SK802 — ReturnTernary
 
+**Уровень:** strict-only.  
+
 Strict-only. Последовательность `if condition: return a; return b` должна быть свернута в `return a if condition else b`.
 
 Autofix: сворачивает простые return-ветки в тернарное выражение.
 
 ## SK803 — LoopComprehension
+
+**Уровень:** strict-only.  
 
 Strict-only. Простой цикл `append` в заранее созданный список должен быть заменён на list comprehension, если это делает код короче и эффективнее.
 
@@ -485,11 +520,15 @@ Autofix: преобразует `items = []; for x in xs: items.append(expr)` в
 
 ## SK804 — PublicAllTuple
 
+**Уровень:** strict-only.  
+
 Strict-only. Непустой модуль с публичными символами должен объявлять `__all__` именно как tuple: `__all__ = (...)`, не list.
 
 Autofix: создаёт или переписывает простой `__all__` tuple template.
 
 ## SK805 — FileWideSuppression
+
+**Уровень:** strict-only.  
 
 Strict-only. В начале файла запрещены глобальные подавления предупреждений для всего файла. Правило проверяет пролог файла до первого кода, а также комментарии сразу после модульного докстринга. Локальные подавления на строках кода не запрещаются.
 
@@ -505,4 +544,256 @@ Strict-only. В начале файла запрещены глобальные 
 # sklint: ignore=SK804
 ```
 
-Autofix: отсутствует, потому что удаление глобального подавления может открыть набор реальных диагностик, которые нужно разобрать вручную.
+Autofix: безопасно удаляет только запрещённый file-wide suppression segment, сохраняя соседний обычный комментарий. Раскрывшиеся после этого реальные diagnostics проверяются на следующем formatter-round.
+
+
+# Rust-native pydoclint port и дополнительные strict rules
+
+`DOCxxx` selectors являются алиасами соответствующих `SKDxxx` для upstream-совместимости. Исключение — собственное расширение `SKD608`, у которого нет upstream `DOC608`.
+
+## SKD001 — DocstringParseError
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Докстринг не удалось корректно разобрать в выбранном/обнаруженном стиле; downstream pydoclint-диагностики для этого докстринга подавляются, чтобы не создавать каскад ложных ошибок.
+
+## SKD002 — PythonSyntaxError
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Python source не удалось разобрать RustPython AST. Диагностика совместима с DOC002 и выдаётся на строке 0; для `invalid non-printable character` выполняется upstream-compatible retry после удаления известных invisible Unicode characters.
+
+## SKD003 — DocstringStyleMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+При включённом `check-style-mismatch` обнаруженный стиль докстринга отличается от configured pydoclint style.
+
+## SKD101 — DocstringArgumentsMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+В секции параметров отсутствуют аргументы из сигнатуры. Formatter может создать полностью отсутствующую секцию из AST, но не реконструирует частично авторскую секцию.
+
+## SKD102 — DocstringArgumentsExtra
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+В докстринге задокументированы параметры, которых нет в эффективной сигнатуре.
+
+## SKD103 — DocstringArgumentsMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Набор имён параметров докстринга и эффективной сигнатуры различается.
+
+## SKD104 — DocstringArgumentOrder
+
+**Уровень:** strict-only.  \n**Autofix:** условный lossless fix для Google/NumPy.
+
+Параметры описаны не в порядке эффективной сигнатуры. Formatter переставляет исходные item-блоки целиком только при однозначном 1:1 соответствии; Sphinx автоматически не переставляется.
+
+## SKD105 — DocstringArgumentTypeMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Тип параметра в докстринге не соответствует аннотации сигнатуры с учётом нормализации pydoclint.
+
+## SKD106 — SignatureArgumentTypesMissingAll
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Конфигурация требует type hints в сигнатуре, но они отсутствуют у всех проверяемых аргументов.
+
+## SKD107 — SignatureArgumentTypesMissingSome
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Конфигурация требует type hints в сигнатуре, но они отсутствуют у части аргументов.
+
+## SKD108 — SignatureArgumentTypesForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Конфигурация запрещает type hints в сигнатуре, но они присутствуют.
+
+## SKD109 — DocstringArgumentTypesMissingAll
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Конфигурация требует типы параметров в докстринге, но они отсутствуют у всех параметров.
+
+## SKD110 — DocstringArgumentTypesMissingSome
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Конфигурация требует типы параметров в докстринге, но они отсутствуют у части параметров.
+
+## SKD111 — DocstringArgumentTypesForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Конфигурация запрещает type hints параметров в докстринге, но они присутствуют.
+
+## SKD201 — ReturnSectionMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+Функция возвращает значение, но секция `Returns` отсутствует. Formatter создаёт её только когда return type можно безопасно вывести из AST.
+
+## SKD202 — ReturnSectionUnnecessary
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+В докстринге есть `Returns`, хотя функция не имеет документируемого return.
+
+## SKD203 — ReturnTypeMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Тип в `Returns` не соответствует return annotation.
+
+## SKD301 — InitDocstringForbidden
+
+**Уровень:** opt-in.  \n**Autofix:** нет.
+
+Отдельный docstring у `__init__` запрещён. В SKLint это правило намеренно выключено по умолчанию даже в strict-mode и активируется только явным `select` (`DOC301`/`SKD301` или явный prefix selector).
+
+## SKD302 — ClassReturnSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Class docstring не должен содержать `Returns` для конструктора.
+
+## SKD303 — InitReturnSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Docstring `__init__` не должен содержать `Returns`.
+
+## SKD304 — ClassArgumentSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Когда документацией аргументов владеет `__init__`, секция аргументов class docstring запрещена.
+
+## SKD305 — ClassRaisesSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Когда документацией исключений владеет `__init__`, `Raises` в class docstring запрещён.
+
+## SKD306 — ClassYieldSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Class docstring не должен содержать `Yields` для конструктора.
+
+## SKD307 — InitYieldSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Docstring `__init__` не должен содержать `Yields`.
+
+## SKD402 — YieldSectionMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+Generator содержит `yield`, но секция `Yields` отсутствует. Formatter создаёт её только когда yield type можно вывести из annotation/AST.
+
+## SKD403 — YieldSectionUnnecessary
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+В докстринге есть `Yields`, хотя функция не является документируемым generator.
+
+## SKD404 — YieldTypeMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Тип в `Yields` не соответствует generator annotation.
+
+## SKD405 — GeneratorReturnAnnotationMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Функция одновременно возвращает значение и yield-ит, но annotation не соответствует Generator-подобной семантике.
+
+## SKD501 — RaisesSectionMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+Функция явно поднимает исключения, но `Raises` отсутствует. Formatter может создать полностью отсутствующую секцию из известных AST exception names.
+
+## SKD502 — RaisesSectionUnnecessary
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Докстринг объявляет исключения, которые функция не поднимает.
+
+## SKD503 — RaisedExceptionsMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Набор документированных исключений не совпадает с реально поднимаемыми; дубликаты также считаются ошибкой.
+
+## SKD504 — AssertRaisesSectionMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+При включённой соответствующей опции `assert` требует `AssertionError` в `Raises`; полностью отсутствующую секцию formatter может создать.
+
+## SKD601 — ClassAttributesMissing
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe structural fix.
+
+В class docstring отсутствуют эффективные class/dataclass/PEP 681 attributes. Formatter может создать полностью отсутствующую секцию из модели полей.
+
+## SKD602 — ClassAttributesExtra
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+В class docstring задокументированы атрибуты, которых нет в effective field model.
+
+## SKD603 — ClassAttributesMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Набор документированных class attributes отличается от effective field model.
+
+## SKD604 — ClassAttributeOrder
+
+**Уровень:** strict-only.  \n**Autofix:** условный lossless fix для Google/NumPy.
+
+Порядок class attributes отличается от effective field order, включая наследуемые dataclass/PEP 681 fields. Formatter переставляет оригинальные блоки только при однозначном соответствии.
+
+## SKD605 — ClassAttributeTypeMismatch
+
+**Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
+
+Тип class attribute в докстринге отличается от аннотации/эффективного default-aware field type.
+
+## SKD606 — InlineClassAttributeDocForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Inline-документация class attribute запрещена, когда configured policy требует class docstring section.
+
+## SKD607 — ClassAttributesSectionForbidden
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+`Attributes` section запрещена, когда configured policy требует inline class-variable docs.
+
+## SKD608 — DocstringArgumentDescriptionEmpty
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Каждый документированный параметр/аргумент обязан иметь непустое описание. Поддерживаются Google, NumPy и Sphinx, включая multiline descriptions.
+
+## SK901 — MagicNumericConstant
+
+**Уровень:** strict-only.  \n**Autofix:** нет.
+
+Запрещает неочевидные числовые константы по объединённой семантике Ruff PLR2004 и WPS432. Разрешены self-documenting literal contexts/common values и специальные `sys.version*` comparisons; всё тело точного `if __name__ == "__main__":` исключено.
+

@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 sklint-core = { path = "../sklint-core" }
+regex = "1"

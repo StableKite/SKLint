@@ -4,8 +4,10 @@ use crate::config::{load_pyproject_for_file, parse_inline_config, EffectiveConfi
 use crate::diagnostic::{Diagnostic, Fix, Span};
 use crate::docstrings::run_docstring_rules;
 use crate::dynamic_attrs::run_dynamic_attribute_rules;
+use crate::magic_constants::run_magic_constant_rule;
+use crate::pydoclint::run_pydoclint_rules;
 use crate::rules::rule_by_code;
-use crate::suppression::SuppressionState;
+use crate::suppression::{unused_selector_replacement, SuppressionState};
 use crate::syntax_rules::run_syntax_rules;
 use std::path::{Path, PathBuf};
 
@@ -36,42 +38,95 @@ pub fn analyze(input: AnalysisInput) -> AnalysisReport {
         }
 
         let suppression_line = diagnostic.suppression_line.unwrap_or(diagnostic.line);
-        let ids = suppressions.suppressing_ids_for(suppression_line, &diagnostic.code, None);
-        if ids.is_empty() {
-            visible.push(diagnostic);
+        if let Some(responsible) =
+            suppressions.responsible_match_for(suppression_line, &diagnostic.code, None)
+        {
+            suppressions.mark_match(responsible);
         } else {
-            suppressions.mark_hits(&ids);
+            visible.push(diagnostic);
         }
     }
 
     if config.is_enabled("SK900") {
         for suppression in suppressions.suppressions.clone() {
-            if suppression.hits > 0 {
-                continue;
-            }
-            let ids =
-                suppressions.suppressing_ids_for(suppression.line, "SK900", Some(suppression.id));
-            if !ids.is_empty() {
-                continue;
-            }
+            let selectors = if suppression.codes.is_empty() {
+                vec![None]
+            } else {
+                (0..suppression.codes.len()).map(Some).collect::<Vec<_>>()
+            };
 
-            let rule = rule_by_code("SK900").expect("SK900 exists");
-            visible.push(Diagnostic::new(
-                rule.code,
-                format!("Unused SKLint suppression `{}`", suppression.text),
-                input.path.display().to_string(),
-                Span::new(
-                    suppression.line,
-                    1,
-                    suppression.line,
-                    suppression.text.chars().count().max(1),
-                ),
-                "warning",
-            ));
+            for selector_index in selectors {
+                if suppressions.selector_is_used(suppression.id, selector_index) {
+                    continue;
+                }
+                if suppressions
+                    .responsible_match_for(suppression.line, "SK900", Some(suppression.id))
+                    .is_some()
+                {
+                    continue;
+                }
+
+                let selector_label = selector_index
+                    .and_then(|index| suppression.codes.get(index))
+                    .map(String::as_str)
+                    .unwrap_or("ALL");
+                let rule = rule_by_code("SK900").expect("SK900 exists");
+                let source_line = input
+                    .source
+                    .lines()
+                    .nth(suppression.line.saturating_sub(1))
+                    .unwrap_or_default();
+                let mut diagnostic = Diagnostic::new(
+                    rule.code,
+                    format!(
+                        "Unused SKLint suppression selector `{selector_label}` in `{}`",
+                        suppression.text
+                    ),
+                    input.path.display().to_string(),
+                    Span::new(
+                        suppression.line,
+                        1,
+                        suppression.line,
+                        source_line.chars().count().saturating_add(1).max(1),
+                    ),
+                    "warning",
+                );
+                if let Some(replacement) =
+                    unused_selector_replacement(source_line, &suppression, selector_index)
+                {
+                    diagnostic = diagnostic.with_fix(Fix {
+                        safe: true,
+                        message: format!(
+                            "Remove unused SKLint suppression selector `{selector_label}`"
+                        ),
+                        replacement,
+                        start_line: suppression.line,
+                        start_column: 1,
+                        end_line: suppression.line,
+                        end_column: source_line.chars().count() + 1,
+                    });
+                }
+                visible.push(diagnostic);
+            }
         }
     }
 
-    visible.sort_by(|a, b| {
+    sort_diagnostics_preserving_pydoclint_order(&mut visible);
+
+    AnalysisReport {
+        diagnostics: visible,
+        config,
+    }
+}
+
+fn sort_diagnostics_preserving_pydoclint_order(diagnostics: &mut [Diagnostic]) {
+    let pydoclint_order = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code.starts_with("SKD"))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    diagnostics.sort_by(|a, b| {
         (a.path.as_str(), a.line, a.column, a.code.as_str()).cmp(&(
             b.path.as_str(),
             b.line,
@@ -80,9 +135,18 @@ pub fn analyze(input: AnalysisInput) -> AnalysisReport {
         ))
     });
 
-    AnalysisReport {
-        diagnostics: visible,
-        config,
+    // Upstream pydoclint exposes Visitor emission order, which is not always
+    // numeric-code order (for example DOC107 can precede DOC103 on the same
+    // function). Preserve SKLint's normal sorted diagnostic slots while
+    // restoring the relative SKD sequence inside those slots.
+    let mut pydoclint_order = pydoclint_order.into_iter();
+    for diagnostic in diagnostics
+        .iter_mut()
+        .filter(|diagnostic| diagnostic.code.starts_with("SKD"))
+    {
+        *diagnostic = pydoclint_order
+            .next()
+            .expect("pydoclint diagnostic count is unchanged by sorting");
     }
 }
 
@@ -208,19 +272,33 @@ fn inspect_file_wide_suppression_line(
         return;
     }
 
-    for segment in hash_comment_segments(&line[comment_start..]) {
+    for (segment_start, segment_end, segment) in hash_comment_segments(&line[comment_start..]) {
         let Some(kind) = file_wide_suppression_kind(segment) else {
             continue;
         };
-        let column = line.chars().take(comment_start).count() + 1;
-        let end_column = line.chars().count() + 1;
-        diagnostics.push(Diagnostic::new(
-            "SK805",
-            format!("File-wide `{kind}` suppression is forbidden in strict mode"),
-            display_path.to_string(),
-            Span::new(line_no, column, line_no, end_column.max(column + 1)),
-            "warning",
-        ));
+        let absolute_start = comment_start + segment_start;
+        let absolute_end = comment_start + segment_end;
+        let column = line[..absolute_start].chars().count() + 1;
+        let segment_end_column = line[..absolute_end].chars().count() + 1;
+        let replacement = remove_hash_comment_segment(line, absolute_start, absolute_end);
+        diagnostics.push(
+            Diagnostic::new(
+                "SK805",
+                format!("File-wide `{kind}` suppression is forbidden in strict mode"),
+                display_path.to_string(),
+                Span::new(line_no, column, line_no, segment_end_column.max(column + 1)),
+                "warning",
+            )
+            .with_fix(Fix {
+                safe: true,
+                message: format!("Remove forbidden file-wide `{kind}` suppression"),
+                replacement,
+                start_line: line_no,
+                start_column: 1,
+                end_line: line_no,
+                end_column: line.chars().count() + 1,
+            }),
+        );
     }
 }
 
@@ -250,11 +328,35 @@ fn triple_quote_prefix(trimmed: &str) -> Option<&'static str> {
     }
 }
 
-fn hash_comment_segments(comment: &str) -> Vec<&str> {
-    comment
+fn hash_comment_segments(comment: &str) -> Vec<(usize, usize, &str)> {
+    let starts = comment
         .match_indices('#')
-        .map(|(idx, _)| &comment[idx..])
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(position, start)| {
+            let end = starts.get(position + 1).copied().unwrap_or(comment.len());
+            (*start, end, &comment[*start..end])
+        })
         .collect()
+}
+
+fn remove_hash_comment_segment(line: &str, start: usize, end: usize) -> String {
+    let leading_indent = line
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .collect::<String>();
+    let before = line[..start].trim_end_matches([' ', '\t']);
+    let after = line[end..].trim_start_matches([' ', '\t']);
+
+    match (before.trim().is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{leading_indent}{after}"),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before}  {after}"),
+    }
 }
 
 fn file_wide_suppression_kind(comment: &str) -> Option<&'static str> {
@@ -410,7 +512,9 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
     diagnostics.extend(run_comment_rules(path, source, config));
     diagnostics.extend(run_blank_line_rules(path, source, config));
     diagnostics.extend(run_docstring_rules(path, source, config));
+    diagnostics.extend(run_pydoclint_rules(path, source, config));
     diagnostics.extend(run_dynamic_attribute_rules(path, source, config));
+    diagnostics.extend(run_magic_constant_rule(path, source, config));
     diagnostics.extend(run_syntax_rules(path, source, config));
 
     diagnostics
@@ -427,6 +531,37 @@ mod tests {
             source: source.to_string(),
             vscode_config: VscodeConfig::default(),
         }
+    }
+
+    #[test]
+    fn pydoclint_diagnostics_preserve_upstream_emission_order() {
+        let report = analyze(input(
+            r#"# sklint: strict
+def f(a, b: int):
+    """Summary.
+
+    Args:
+        a (str): A.
+        c (int): C.
+    """
+    pass
+"#,
+        ));
+        let codes = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.starts_with("SKD"))
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>();
+        let pos_107 = codes
+            .iter()
+            .position(|code| *code == "SKD107")
+            .expect("SKD107");
+        let pos_103 = codes
+            .iter()
+            .position(|code| *code == "SKD103")
+            .expect("SKD103");
+        assert!(pos_107 < pos_103, "upstream emits DOC107 before DOC103");
     }
 
     #[test]
@@ -454,6 +589,42 @@ mod tests {
     }
 
     #[test]
+    fn t201_noqa_suppresses_sk201_without_unused_suppression() {
+        let report = analyze(input("print('debug')  # noqa: T201\n"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK201"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
+    fn sk201_noqa_still_suppresses_print_rule() {
+        let report = analyze(input("print('debug')  # noqa: SK201\n"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK201"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
+    fn sk900_reports_only_redundant_selector_and_offers_safe_fix() {
+        let report = analyze(input("x=1  # noqa: E501, SK4, SK401\n"));
+        let unused = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.code == "SK900")
+            .collect::<Vec<_>>();
+        assert_eq!(unused.len(), 1);
+        assert!(unused[0].message.contains("SK4"));
+        let fix = unused[0].fix.as_ref().expect("safe selective fix");
+        assert!(fix.safe);
+        assert_eq!(fix.replacement, "x=1  # noqa: E501, SK401");
+    }
+
+    #[test]
+    fn used_catch_all_suppression_is_not_reported_unused() {
+        let report = analyze(input("x=1  # sklint: ignore\n"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK401"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
     fn unused_noqa_is_reported() {
         let report = analyze(input("x = 1  # noqa: SK001\n"));
         assert!(report.diagnostics.iter().any(|diag| diag.code == "SK900"));
@@ -468,6 +639,58 @@ mod tests {
             .diagnostics
             .iter()
             .all(|diag| !diag.code.starts_with("SK6")));
+    }
+
+    #[test]
+    fn doc_prefix_noqa_on_docstring_closing_line_suppresses_skd203() {
+        let report = analyze(input(
+            r#"# sklint: strict
+def f() -> int:
+    """Summary.
+
+    Returns:
+        str: Value.
+    """  # noqa: DOC2
+    return 1
+"#,
+        ));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SKD203"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
+    fn explanatory_prefix_noqa_on_docstring_closing_line_matches_upstream() {
+        let report = analyze(input(
+            r#"# sklint: strict
+def funcDocstringComment(arg1: int, arg2: int) -> None:
+    """Demonstrate docstring comment suppression.
+
+    Args:
+        arg1 (int): Documented argument.
+
+    """  # explanation noqa: doc101, doc103, F401 trailing words
+    pass
+"#,
+        ));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SKD101"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SKD103"));
+        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
+    fn bare_noqa_on_docstring_closing_line_does_not_suppress_skd203() {
+        let report = analyze(input(
+            r#"# sklint: strict
+def f() -> int:
+    """Summary.
+
+    Returns:
+        str: Value.
+    """  # noqa
+    return 1
+"#,
+        ));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SKD203"));
     }
 
     #[test]
@@ -521,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn docstring_last_content_line_suppresses_docstring_diagnostic() {
+    fn noqa_text_inside_docstring_does_not_suppress_docstring_diagnostic() {
         let report = analyze(input(
             r#"def f():
     """
@@ -531,7 +754,7 @@ mod tests {
     pass
 "#,
         ));
-        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK617"));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK617"));
         assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
     }
 
@@ -582,5 +805,35 @@ mod tests {
     fn strict_mode_global_sklint_noqa_cannot_hide_sk805() {
         let report = analyze(input("# sklint: strict\n# sklint: noqa\nvalue = 1\n"));
         assert!(report.diagnostics.iter().any(|diag| diag.code == "SK805"));
+    }
+    #[test]
+    fn sk805_safe_fix_removes_only_forbidden_segment() {
+        let report = analyze(input(
+            "# sklint: strict\n# ordinary context  # ruff: noqa: F401\nvalue = 1\n",
+        ));
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diag| diag.code == "SK805")
+            .expect("SK805");
+        let fix = diagnostic.fix.as_ref().expect("safe fix");
+        assert!(fix.safe);
+        assert_eq!(fix.replacement, "# ordinary context");
+    }
+
+    #[test]
+    fn sk805_safe_fix_preserves_comment_after_suppression() {
+        let report = analyze(input(
+            "# sklint: strict\n# ruff: noqa: F401  # ordinary context\nvalue = 1\n",
+        ));
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diag| diag.code == "SK805")
+            .expect("SK805");
+        assert_eq!(
+            diagnostic.fix.as_ref().expect("safe fix").replacement,
+            "# ordinary context"
+        );
     }
 }

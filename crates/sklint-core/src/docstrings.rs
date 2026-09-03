@@ -1,6 +1,9 @@
 use crate::config::EffectiveConfig;
+use crate::dataclass_model::{DataclassField, DataclassModel};
 use crate::diagnostic::{Diagnostic, Fix, Span};
-use std::collections::{HashMap, HashSet};
+use crate::pydoclint_doc::DocStyle;
+use crate::python_ast::PythonAst;
+use std::collections::HashMap;
 use std::path::Path;
 
 const ALLOWED_SECTIONS: &[&str] = &["Args", "Attributes", "Returns", "Yields", "Raises"];
@@ -48,23 +51,6 @@ struct Section {
     end_idx: usize,
 }
 
-#[derive(Debug, Clone)]
-struct ClassInfo {
-    name: String,
-    line: usize,
-    bases: Vec<String>,
-    has_dataclass: bool,
-    doc_start: Option<usize>,
-    doc_end: Option<usize>,
-    fields: Vec<FieldInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FieldInfo {
-    name: String,
-    ty: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttributeDoc {
     name: String,
@@ -76,7 +62,13 @@ pub fn run_docstring_rules(path: &Path, source: &str, config: &EffectiveConfig) 
     let display_path = path.display().to_string();
     let lines: Vec<&str> = source.lines().collect();
     let docs = find_docstrings(&lines);
-    let classes = collect_classes(&lines, &docs);
+    let dataclass_model = if config.is_enabled("SK619") || config.is_enabled("SK620") {
+        PythonAst::parse(source, &display_path)
+            .ok()
+            .map(|ast| DataclassModel::from_path(path, source, &ast))
+    } else {
+        None
+    };
     let mut diagnostics = Vec::new();
 
     for doc in &docs {
@@ -84,8 +76,73 @@ pub fn run_docstring_rules(path: &Path, source: &str, config: &EffectiveConfig) 
     }
 
     run_constant_rules(&display_path, &lines, &docs, config, &mut diagnostics);
-    run_dataclass_rules(&display_path, &classes, &docs, config, &mut diagnostics);
+    if let Some(model) = dataclass_model.as_ref() {
+        run_dataclass_rules(&display_path, model, &docs, config, &mut diagnostics);
+    }
     diagnostics
+}
+
+fn wrap_plain_docstring_line(line: &str, max_columns: usize) -> Option<String> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indent = &line[..line.len() - trimmed.len()];
+    if trimmed.is_empty()
+        || trimmed.starts_with("\"\"\"")
+        || trimmed.starts_with("'''")
+        || trimmed.starts_with(':')
+        || trimmed.starts_with(".. ")
+        || trimmed.starts_with('@')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+        || trimmed.chars().all(|ch| ch == '-' || ch == '=')
+        || trimmed.ends_with(':')
+        || looks_like_structured_docstring_item(trimmed)
+    {
+        return None;
+    }
+
+    let indent_columns = indent.chars().count();
+    let available = max_columns.saturating_sub(indent_columns);
+    if available < 8 || trimmed.chars().count() <= available {
+        return None;
+    }
+
+    let mut split_byte = None;
+    for (byte, ch) in trimmed.char_indices() {
+        let column = trimmed[..byte].chars().count();
+        if column > available {
+            break;
+        }
+        if ch.is_whitespace() && column > 0 {
+            split_byte = Some(byte);
+        }
+    }
+    let split_byte = split_byte?;
+    let first = trimmed[..split_byte].trim_end();
+    let second = trimmed[split_byte..].trim_start();
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    Some(format!("{indent}{first}\n{indent}{second}"))
+}
+
+fn looks_like_structured_docstring_item(trimmed: &str) -> bool {
+    if trimmed.contains(" : ") {
+        return true;
+    }
+    let Some((left, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let left = left.trim();
+    if left.is_empty() || (left.contains(' ') && !left.contains('(')) {
+        return false;
+    }
+    left.chars().all(|ch| {
+        ch.is_alphanumeric()
+            || matches!(
+                ch,
+                '_' | '*' | '.' | '(' | ')' | '[' | ']' | ',' | ' ' | '-'
+            )
+    })
 }
 
 fn run_rules_for_doc(
@@ -101,13 +158,25 @@ fn run_rules_for_doc(
             let clean = line.trim_end_matches([' ', '\t']);
             let len = clean.chars().count();
             if len > 72 {
-                diagnostics.push(doc_diag(
+                let mut diagnostic = doc_diag(
                     "SK601",
                     "Docstring line is longer than 72 characters",
                     display_path,
                     Span::new(line_no, 73, line_no, len + 1),
                     doc,
-                ));
+                );
+                if let Some(replacement) = wrap_plain_docstring_line(clean, 72) {
+                    diagnostic = diagnostic.with_fix(Fix {
+                        safe: true,
+                        message: "Wrap long docstring prose at a word boundary".to_string(),
+                        replacement,
+                        start_line: line_no,
+                        start_column: 1,
+                        end_line: line_no,
+                        end_column: len + 1,
+                    });
+                }
+                diagnostics.push(diagnostic);
             }
         }
     }
@@ -149,17 +218,13 @@ fn run_rules_for_doc(
     if config.is_enabled("SK602") {
         for item in &doc.content {
             let trimmed = item.text.trim_start();
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with(":param")
-                || lower.starts_with(":return")
-                || lower.starts_with(":raises")
-                || lower.starts_with("@param")
-                || lower.starts_with("@return")
-                || is_numpy_section_line(trimmed)
-            {
+            if docstring_line_uses_other_style(trimmed, config.formatter_docstring_style) {
                 diagnostics.push(doc_diag(
                     "SK602",
-                    "Docstring must use Google style instead of reST, Numpy or Javadoc style",
+                    format!(
+                        "Docstring must use configured {} style",
+                        doc_style_name(config.formatter_docstring_style)
+                    ),
                     display_path,
                     Span::new(
                         item.line,
@@ -942,7 +1007,7 @@ fn missing_constant_doc_diag(
 
 fn run_dataclass_rules(
     display_path: &str,
-    classes: &[ClassInfo],
+    model: &DataclassModel,
     docs: &[Docstring],
     config: &EffectiveConfig,
     diagnostics: &mut Vec<Diagnostic>,
@@ -951,18 +1016,14 @@ fn run_dataclass_rules(
         return;
     }
 
-    let by_name: HashMap<String, &ClassInfo> = classes
-        .iter()
-        .map(|class| (class.name.clone(), class))
-        .collect();
-    for class in classes.iter().filter(|class| class.has_dataclass) {
-        let Some(doc_start) = class.doc_start else {
+    for class in model.classes.iter().filter(|class| class.is_dataclass_like) {
+        let Some(doc) = docs
+            .iter()
+            .find(|doc| doc.owner.kind == OwnerKind::Class && doc.owner.line == class.line)
+        else {
             continue;
         };
-        let Some(doc) = docs.iter().find(|doc| doc.start_line == doc_start) else {
-            continue;
-        };
-        let fields = inherited_fields(class, &by_name);
+        let fields = model.effective_fields(&class.name);
         if fields.is_empty() {
             continue;
         }
@@ -974,7 +1035,7 @@ fn run_dataclass_rules(
             .collect();
         let documented_order: Vec<String> = attrs.iter().map(|attr| attr.name.clone()).collect();
         let expected_order: Vec<String> = fields.iter().map(|field| field.name.clone()).collect();
-        let missing: Vec<&FieldInfo> = fields
+        let missing: Vec<&DataclassField> = fields
             .iter()
             .filter(|field| !attrs_by_name.contains_key(&field.name))
             .collect();
@@ -1001,7 +1062,7 @@ fn run_dataclass_rules(
                         .join(", ")
                 )
             };
-            let line = class.doc_end.unwrap_or(class.line);
+            let line = doc.end_line;
             let mut diagnostic = doc_diag(
                 "SK619",
                 message,
@@ -1061,7 +1122,7 @@ fn run_dataclass_rules(
 
 fn dataclass_attributes_fix(
     doc: &Docstring,
-    fields: &[FieldInfo],
+    fields: &[DataclassField],
     attrs_by_name: &HashMap<String, AttributeDoc>,
 ) -> Option<Fix> {
     let attr_section = sections(doc)
@@ -1476,6 +1537,47 @@ fn top_level_section_heading_name(doc: &Docstring, text: &str) -> Option<String>
     section_heading_name(text)
 }
 
+fn doc_style_name(style: DocStyle) -> &'static str {
+    match style {
+        DocStyle::Google => "Google",
+        DocStyle::Numpy => "NumPy",
+        DocStyle::Sphinx => "Sphinx",
+    }
+}
+
+fn docstring_line_uses_other_style(line: &str, configured: DocStyle) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let sphinx = lower.starts_with(":param")
+        || lower.starts_with(":type")
+        || lower.starts_with(":return")
+        || lower.starts_with(":rtype")
+        || lower.starts_with(":yield")
+        || lower.starts_with(":ytype")
+        || lower.starts_with(":raises")
+        || lower.starts_with(".. attribute ::");
+    let javadoc = lower.starts_with("@param") || lower.starts_with("@return");
+    let numpy = is_numpy_section_line(trimmed);
+    let google = matches!(
+        trimmed,
+        "Args:"
+            | "Arguments:"
+            | "Parameters:"
+            | "Params:"
+            | "Attributes:"
+            | "Returns:"
+            | "Yields:"
+            | "Raises:"
+            | "Exceptions:"
+            | "Except:"
+    );
+    match configured {
+        DocStyle::Google => sphinx || numpy || javadoc,
+        DocStyle::Numpy => sphinx || google || javadoc,
+        DocStyle::Sphinx => numpy || google || javadoc,
+    }
+}
+
 fn is_numpy_section_line(text: &str) -> bool {
     matches!(text, "Parameters" | "Returns" | "Raises" | "Attributes")
 }
@@ -1808,126 +1910,6 @@ fn final_assignment_end_line(lines: &[&str], start_idx: usize) -> usize {
     lines.len()
 }
 
-fn collect_classes(lines: &[&str], docs: &[Docstring]) -> Vec<ClassInfo> {
-    let mut classes = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        let Some((name, bases)) = parse_class_header(trimmed) else {
-            continue;
-        };
-        let indent = indent_width(line);
-        let decorators = decorators_before(lines, idx);
-        let has_dataclass = decorators.iter().any(|decorator| {
-            decorator.contains("dataclass") || decorator.contains("dataclass_transform")
-        });
-        let doc = docs
-            .iter()
-            .find(|doc| doc.owner.kind == OwnerKind::Class && doc.owner.line == idx + 1);
-        let fields = class_fields(lines, idx + 1, indent);
-        classes.push(ClassInfo {
-            name,
-            line: idx + 1,
-            bases,
-            has_dataclass,
-            doc_start: doc.map(|doc| doc.start_line),
-            doc_end: doc.map(|doc| doc.end_line),
-            fields,
-        });
-    }
-    classes
-}
-
-fn decorators_before(lines: &[&str], class_idx: usize) -> Vec<String> {
-    let mut decorators = Vec::new();
-    let mut idx = class_idx;
-    while idx > 0 {
-        idx -= 1;
-        let trimmed = lines[idx].trim();
-        if trimmed.starts_with('@') {
-            decorators.push(trimmed.to_string());
-            continue;
-        }
-        if trimmed.is_empty() {
-            continue;
-        }
-        break;
-    }
-    decorators
-}
-
-fn class_fields(lines: &[&str], class_line: usize, class_indent: usize) -> Vec<FieldInfo> {
-    let mut fields = Vec::new();
-    for line in lines.iter().skip(class_line) {
-        if line.trim().is_empty()
-            || line.trim_start().starts_with('#')
-            || line.trim_start().starts_with('@')
-        {
-            continue;
-        }
-        let indent = indent_width(line);
-        if indent <= class_indent {
-            break;
-        }
-        if indent != class_indent + 4 {
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("def ")
-            || trimmed.starts_with("async def ")
-            || trimmed.starts_with("class ")
-        {
-            continue;
-        }
-        let Some((name_part, rest)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let name = name_part.trim();
-        if !is_identifier(name) {
-            continue;
-        }
-        let ty = rest.split_once('=').map(|(left, _)| left).unwrap_or(rest);
-        let ty = strip_inline_comment(ty).trim();
-        if ty.is_empty() || ty.starts_with("ClassVar") {
-            continue;
-        }
-        fields.push(FieldInfo {
-            name: name.to_string(),
-            ty: ty.to_string(),
-        });
-    }
-    fields
-}
-
-fn inherited_fields(class: &ClassInfo, by_name: &HashMap<String, &ClassInfo>) -> Vec<FieldInfo> {
-    fn visit(
-        class: &ClassInfo,
-        by_name: &HashMap<String, &ClassInfo>,
-        seen: &mut HashSet<String>,
-        out: &mut Vec<FieldInfo>,
-    ) {
-        if !seen.insert(class.name.clone()) {
-            return;
-        }
-        for base in &class.bases {
-            if let Some(base_class) = by_name.get(base) {
-                visit(base_class, by_name, seen, out);
-            }
-        }
-        for field in &class.fields {
-            if let Some(pos) = out.iter().position(|old| old.name == field.name) {
-                out[pos] = field.clone();
-            } else {
-                out.push(field.clone());
-            }
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    visit(class, by_name, &mut seen, &mut out);
-    out
-}
-
 fn attribute_docs(doc: &Docstring) -> Vec<AttributeDoc> {
     let sections = sections(doc);
     let Some(section) = sections.iter().find(|section| section.name == "Attributes") else {
@@ -2044,33 +2026,6 @@ fn first_non_ws_col(text: &str) -> usize {
     text.chars().take_while(|ch| ch.is_whitespace()).count() + 1
 }
 
-fn strip_inline_comment(text: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (idx, ch) in text.char_indices() {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == active {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '#' => return &text[..idx],
-            '\'' | '"' => quote = Some(ch),
-            _ => {}
-        }
-    }
-    text
-}
-
 fn normalize_type(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
@@ -2092,6 +2047,30 @@ fn doc_diag(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sk601_plain_prose_has_safe_wrap_but_structured_items_do_not() {
+        let prose = "    This is a deliberately long ordinary documentation sentence that can be wrapped safely at a normal word boundary without changing meaning";
+        let replacement = wrap_plain_docstring_line(prose, 72).expect("plain prose fix");
+        assert!(replacement.contains('\n'));
+        assert!(replacement.lines().all(|line| line.chars().count() <= 72));
+
+        assert!(wrap_plain_docstring_line(
+            "        value (VeryLongTypeName): This is a deliberately long Google item description that belongs to SK624 instead",
+            72,
+        )
+        .is_none());
+        assert!(wrap_plain_docstring_line(
+            "    value : SomeVeryLongNumpyTypeNameThatMakesThisDeclarationLongEnoughToOverflow",
+            72,
+        )
+        .is_none());
+        assert!(wrap_plain_docstring_line(
+            "    :param value: This is a deliberately long Sphinx parameter line that must remain structural",
+            72,
+        )
+        .is_none());
+    }
+
     use super::*;
     use crate::config::{EffectiveConfig, FileInlineConfig, PyProjectConfig, VscodeConfig};
 

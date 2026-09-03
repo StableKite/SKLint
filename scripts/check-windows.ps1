@@ -17,6 +17,16 @@ function Find-Python {
 Write-Host "`n== Project identity =="
 Get-Content .\README.md -TotalCount 12
 
+Write-Host "`n== Release audits =="
+$AuditPython = Find-Python
+if (-not $AuditPython) { throw "Python is required for release audit scripts." }
+& $AuditPython.Exe @($AuditPython.Args) scripts\audit-rule-docs.py
+if ($LASTEXITCODE -ne 0) { throw "rule-doc audit failed" }
+& $AuditPython.Exe @($AuditPython.Args) scripts\audit-fix-coverage.py
+if ($LASTEXITCODE -ne 0) { throw "fix-policy audit failed" }
+& $AuditPython.Exe @($AuditPython.Args) scripts\audit-pydoclint-port.py
+if ($LASTEXITCODE -ne 0) { throw "pydoclint-port audit failed" }
+
 Write-Host "`n== Windows Rust checks =="
 cargo --version
 rustc --version

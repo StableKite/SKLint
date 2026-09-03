@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+PYTHON_BIN="${PYTHON:-python3}"
+"$PYTHON_BIN" scripts/audit-rule-docs.py
+"$PYTHON_BIN" scripts/audit-fix-coverage.py
+"$PYTHON_BIN" scripts/audit-pydoclint-port.py
+
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -24,8 +29,6 @@ if "$BIN" format --check examples/bad.py; then
   echo "expected format --check to report changes for examples/bad.py" >&2
   exit 1
 fi
-
-PYTHON_BIN="${PYTHON:-python3}"
 
 JSON_FIX_DIR="$(mktemp -d)"
 echo 'value=1' > "$JSON_FIX_DIR/case.py"

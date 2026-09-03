@@ -1302,7 +1302,9 @@ def build():
             VscodeConfig::default(),
         );
 
-        assert_eq!(report.source, source);
+        assert!(report.source.contains("x = get_value()"));
+        assert!(report.source.contains("return xя"));
+        assert!(!report.source.contains("return get_value()"));
     }
 
     #[test]
@@ -1314,7 +1316,9 @@ def build():
             VscodeConfig::default(),
         );
 
-        assert_eq!(report.source, source);
+        assert!(report.source.contains("x = get_value()"));
+        assert!(report.source.contains("return яx"));
+        assert!(!report.source.contains("return get_value()"));
     }
 
     #[test]
@@ -1326,7 +1330,9 @@ def build():
             VscodeConfig::default(),
         );
 
-        assert_eq!(report.source, source);
+        assert!(report.source.contains("x = get_value()"));
+        assert!(report.source.contains("return x\u{301}"));
+        assert!(!report.source.contains("return get_value()"));
     }
 
     #[test]
@@ -1445,5 +1451,284 @@ def g(flag: str) -> str:
             .source
             .contains("return \"a\" if flag == \"x\" else \"b\""));
         assert!(!report.source.contains("return _"));
+    }
+    fn pydoclint_format_config(style: Option<crate::pydoclint_doc::DocStyle>) -> VscodeConfig {
+        VscodeConfig {
+            strict: Some(true),
+            formatter_docstring_style: style,
+            ..VscodeConfig::default()
+        }
+    }
+
+    fn format_with_pydoclint_toml(source: &str, toml: &str) -> FormatReport {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-format-pydoclint-{unique}"));
+        fs::create_dir_all(&root).expect("create temp project");
+        fs::write(
+            root.join("pyproject.toml"),
+            format!("[tool.pydoclint]\n{toml}\n"),
+        )
+        .expect("write pyproject");
+        let path = root.join("case.py");
+        fs::write(&path, source).expect("write source");
+        let report = format_source(
+            path,
+            source.to_string(),
+            VscodeConfig {
+                strict: Some(true),
+                ..VscodeConfig::default()
+            },
+        );
+        let _ = fs::remove_dir_all(root);
+        report
+    }
+
+    fn assert_pydoclint_toml_fixed_point(source: &str, toml: &str, expected: &[&str]) {
+        let first = format_with_pydoclint_toml(source, toml);
+        for needle in expected {
+            assert!(
+                first.source.contains(needle),
+                "formatted source did not contain {needle:?}:\n{}",
+                first.source
+            );
+        }
+        let second = format_with_pydoclint_toml(&first.source, toml);
+        assert_eq!(
+            second.applied, 0,
+            "second formatter pass must be a fixed point"
+        );
+        assert_eq!(second.source, first.source);
+    }
+
+    #[test]
+    fn pydoclint_fixes_google_argument_type_mismatch_and_reaches_fixed_point() {
+        let source = r#"def f(value: int) -> None:
+    """Summary.
+
+    Args:
+        value (str): Value.
+    """
+"#;
+        assert_pydoclint_toml_fixed_point(source, "style = \"google\"", &["value (int): Value"]);
+    }
+
+    #[test]
+    fn pydoclint_fixes_numpy_all_missing_argument_types_and_reaches_fixed_point() {
+        let source = r#"def f(value: int, name: str) -> None:
+    """Summary.
+
+    Parameters
+    ----------
+    value
+        Value.
+    name
+        Name.
+    """
+"#;
+        assert_pydoclint_toml_fixed_point(
+            source,
+            "style = \"numpy\"",
+            &["value : int", "name : str"],
+        );
+    }
+
+    #[test]
+    fn pydoclint_fixes_sphinx_some_missing_argument_types_and_reaches_fixed_point() {
+        let source = r#"def f(value: int, name: str) -> None:
+    """Summary.
+
+    :param value: Value
+    :type value: int
+    :param name: Name.
+    """
+"#;
+        assert_pydoclint_toml_fixed_point(source, "style = \"sphinx\"", &[":type name: str"]);
+    }
+
+    #[test]
+    fn pydoclint_removes_forbidden_google_argument_types_and_reaches_fixed_point() {
+        let source = r#"def f(value: int) -> None:
+    """Summary.
+
+    Args:
+        value (int): Value
+    """
+"#;
+        assert_pydoclint_toml_fixed_point(
+            source,
+            "style = \"google\"\narg-type-hints-in-docstring = false",
+            &["value: Value"],
+        );
+    }
+
+    #[test]
+    fn pydoclint_fixes_google_return_type_mismatch_and_reaches_fixed_point() {
+        let source = r#"def f() -> int:
+    """Summary.
+
+    Returns:
+        str: Value.
+    """
+    return 1
+"#;
+        assert_pydoclint_toml_fixed_point(
+            source,
+            "style = \"google\"",
+            &["Returns:\n        int: Value"],
+        );
+    }
+
+    #[test]
+    fn pydoclint_fixes_sphinx_yield_type_mismatch_and_reaches_fixed_point() {
+        let source = r#"from typing import Iterator
+
+def f() -> Iterator[int]:
+    """Summary.
+
+    :yield: Value.
+    :ytype: str
+    """
+    yield 1
+"#;
+        assert_pydoclint_toml_fixed_point(source, "style = \"sphinx\"", &[":ytype: int"]);
+    }
+
+    #[test]
+    fn pydoclint_fixes_numpy_class_attribute_type_mismatch_and_reaches_fixed_point() {
+        let source = r#"class Item:
+    """Summary.
+
+    Attributes
+    ----------
+    value : str
+        Value.
+    """
+
+    value: int = 1
+"#;
+        assert_pydoclint_toml_fixed_point(source, "style = \"numpy\"", &["value : int"]);
+    }
+
+    #[test]
+    fn pydoclint_missing_sections_format_to_google_by_default_and_reach_fixed_point() {
+        let source = r#"def process(value: int) -> str:
+    """Process a value.
+
+    Examples:
+        >>> process(1)
+        '1'
+    """
+    if not value:
+        raise ValueError("empty")
+    return str(value)
+"#;
+        let config = pydoclint_format_config(None);
+        let first = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            config.clone(),
+        );
+        assert!(first
+            .source
+            .contains("Args:\n        value (int): Value for `value`"));
+        assert!(first.source.contains("Returns:\n        str: Return value"));
+        assert!(first
+            .source
+            .contains("Raises:\n        ValueError: Raised when this condition occurs"));
+
+        let after = analyze(AnalysisInput {
+            path: PathBuf::from("example.py"),
+            source: first.source.clone(),
+            vscode_config: config.clone(),
+        });
+        assert!(!after.diagnostics.iter().any(|diag| diag.code == "SKD608"));
+
+        let second = format_source(PathBuf::from("example.py"), first.source.clone(), config);
+        assert_eq!(second.applied, 0);
+        assert_eq!(second.source, first.source);
+    }
+
+    #[test]
+    fn pydoclint_missing_sections_respect_numpy_override_and_reach_fixed_point() {
+        let source = r#"def process(value: int) -> str:
+    """Process a value.
+
+    Examples
+    --------
+    process(1)
+    """
+    return str(value)
+"#;
+        let config = pydoclint_format_config(Some(crate::pydoclint_doc::DocStyle::Numpy));
+        let first = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            config.clone(),
+        );
+        assert!(first
+            .source
+            .contains("Parameters\n    ----------\n    value : int"));
+        assert!(first.source.contains("Returns\n    -------\n    str"));
+        let second = format_source(PathBuf::from("example.py"), first.source.clone(), config);
+        assert_eq!(second.applied, 0);
+        assert_eq!(second.source, first.source);
+    }
+
+    #[test]
+    fn pydoclint_missing_sections_respect_sphinx_override_and_reach_fixed_point() {
+        let source = r#"def process(value: int) -> str:
+    """Process a value.
+
+    :deprecated: 1.0
+    """
+    if not value:
+        raise ValueError("empty")
+    return str(value)
+"#;
+        let config = pydoclint_format_config(Some(crate::pydoclint_doc::DocStyle::Sphinx));
+        let first = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            config.clone(),
+        );
+        assert!(first.source.contains(":param value: Value for `value`"));
+        assert!(first.source.contains(":type value: int"));
+        assert!(first.source.contains(":return: Return value."));
+        assert!(first.source.contains(":rtype: str"));
+        assert!(first
+            .source
+            .contains(":raises ValueError: Raised when this condition occurs"));
+        let second = format_source(PathBuf::from("example.py"), first.source.clone(), config);
+        assert_eq!(second.applied, 0);
+        assert_eq!(second.source, first.source);
+    }
+
+    #[test]
+    fn pydoclint_generates_sphinx_attribute_directives() {
+        let source = r#"class Box:
+    """A box.
+
+    :deprecated: 1.0
+    """
+    value: int = 1
+"#;
+        let config = pydoclint_format_config(Some(crate::pydoclint_doc::DocStyle::Sphinx));
+        let first = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            config.clone(),
+        );
+        assert!(first.source.contains(".. attribute :: value"));
+        assert!(first.source.contains(":type: int"));
+        assert!(first.source.contains("Value for `value`"));
+        let second = format_source(PathBuf::from("example.py"), first.source.clone(), config);
+        assert_eq!(second.applied, 0);
+        assert_eq!(second.source, first.source);
     }
 }

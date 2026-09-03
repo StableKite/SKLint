@@ -109,9 +109,10 @@ external = ["SK"]
 
 ```python
 print("debug")  # noqa: SK201
+print("debug")  # noqa: T201  # Совместимый alias Ruff для того же SK201
 ```
 
-При наведении в VSCode на `SK201` внутри `# noqa: SK201` откроется markdown-справка по правилу.
+При наведении в VSCode на `SK201` внутри `# noqa: SK201` откроется markdown-справка по правилу. Для `SK201` также принимается Ruff-совместимый локальный selector `T201`.
 
 ## 10. Подавление докстринга
 
