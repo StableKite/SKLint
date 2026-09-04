@@ -350,6 +350,15 @@ struct Visitor<'a> {
 }
 
 pub fn run_pydoclint_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnostic> {
+    run_pydoclint_rules_with_syntax_oracle(path, source, config, cpython_syntax_status)
+}
+
+fn run_pydoclint_rules_with_syntax_oracle(
+    path: &Path,
+    source: &str,
+    config: &EffectiveConfig,
+    syntax_status: impl Fn(&str) -> SyntaxOracleStatus,
+) -> Vec<Diagnostic> {
     if !config
         .active_codes
         .iter()
@@ -375,7 +384,7 @@ pub fn run_pydoclint_rules(path: &Path, source: &str, config: &EffectiveConfig) 
                         ast
                     }
                     Err(second_error) => {
-                        return match cpython_syntax_status(source) {
+                        return match syntax_status(source) {
                             SyntaxOracleStatus::Invalid if config.is_enabled("SKD002") => vec![
                                 Diagnostic::new(
                                     "SKD002",
@@ -392,7 +401,7 @@ pub fn run_pydoclint_rules(path: &Path, source: &str, config: &EffectiveConfig) 
                     }
                 }
             } else {
-                return match cpython_syntax_status(source) {
+                return match syntax_status(source) {
                     SyntaxOracleStatus::Valid | SyntaxOracleStatus::Unavailable => Vec::new(),
                     SyntaxOracleStatus::Invalid if config.is_enabled("SKD002") => vec![
                         Diagnostic::new(
@@ -6108,10 +6117,11 @@ def f(other: "Vector2 | NumberType") -> None:
 
     #[test]
     fn skd002_uses_real_line_one_for_syntax_errors() {
-        let diagnostics = run_pydoclint_rules(
+        let diagnostics = run_pydoclint_rules_with_syntax_oracle(
             Path::new("example.py"),
             "def broken(:\n    pass\n",
             &strict_config(),
+            |_| SyntaxOracleStatus::Invalid,
         );
         let diagnostic = diagnostics
             .iter()
@@ -6146,10 +6156,11 @@ def f(other: "Vector2 | NumberType") -> None:
 
     #[test]
     fn skd002_reports_second_parse_error_on_line_one_after_invisible_retry() {
-        let diagnostics = run_pydoclint_rules(
+        let diagnostics = run_pydoclint_rules_with_syntax_oracle(
             Path::new("example.py"),
             "def broken(\u{200b}:\n    pass\n",
             &strict_config(),
+            |_| SyntaxOracleStatus::Invalid,
         );
         let diagnostic = diagnostics
             .iter()
