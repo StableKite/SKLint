@@ -74,7 +74,7 @@ pub fn run_syntax_rules(path: &Path, source: &str, config: &EffectiveConfig) -> 
         run_future_annotations_import(&display_path, source, &lines, &mut diagnostics);
     }
     if config.is_enabled("SK801") {
-        run_inline_temp_variable(&display_path, &lines, &mut diagnostics);
+        run_inline_temp_variable(&display_path, &lines, &defs, &mut diagnostics);
     }
     if config.is_enabled("SK802") {
         run_return_ternary(&display_path, &lines, &mut diagnostics);
@@ -1317,7 +1317,14 @@ fn run_raise_hot_path(
     let allowed = ["__init__", "__post_init__", "run", "close"];
     for line in lines {
         let trimmed = line.code.trim_start();
-        if !trimmed.starts_with("raise") {
+        let Some(after_raise) = trimmed.strip_prefix("raise") else {
+            continue;
+        };
+        if after_raise
+            .chars()
+            .next()
+            .is_some_and(is_identifier_continue)
+        {
             continue;
         }
         let current_def = defs
@@ -1427,6 +1434,7 @@ fn run_future_annotations_import(
 fn run_inline_temp_variable(
     display_path: &str,
     lines: &[LineInfo],
+    defs: &[DefInfo],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for idx in 0..lines.len().saturating_sub(1) {
@@ -1472,14 +1480,31 @@ fn run_inline_temp_variable(
             continue;
         }
 
-        // SK801 may only be considered when the complete following statement
-        // contains exactly one real code occurrence of the temporary name.
-        // Checking both the original and masked statement is deliberately
-        // conservative: the original count catches additional references in
-        // f-string expressions, while the masked count ensures the replacement
-        // target is code rather than string/comment text.
+        // SK801 is about a value that is used exactly once during its lexical
+        // lifetime, not merely once in the immediately following statement.
+        // The old next-statement-only check produced destructive false
+        // positives such as:
+        //
+        //     attitude = ...
+        //     v2 = v1.rotate(attitude)
+        //     v3 = v2.rotate(attitude)
+        //     npv3 = np_rotate(npv2, attitude)
+        //
+        // Keep the existing replacement-target checks, then conservatively
+        // count every later occurrence until the end of the containing
+        // function (or module when at top level). Raw text intentionally makes
+        // this conservative around f-strings/strings/comments: an uncertain
+        // extra occurrence suppresses SK801 rather than risking a bad inline.
         if count_word_uses(&statement_text, name) != 1
             || count_word_uses(&statement_code, name) != 1
+        {
+            continue;
+        }
+        let scope_end_idx = lexical_scope_end_idx(lines, defs, line.no);
+        if statement_end_idx < scope_end_idx
+            && lines[statement_end_idx + 1..=scope_end_idx]
+                .iter()
+                .any(|item| count_word_uses(&item.text, name) > 0)
         {
             continue;
         }
@@ -1512,6 +1537,14 @@ fn run_inline_temp_variable(
         }
         diagnostics.push(diagnostic);
     }
+}
+
+fn lexical_scope_end_idx(lines: &[LineInfo], defs: &[DefInfo], line_no: usize) -> usize {
+    defs.iter()
+        .filter(|def| def.kind == DefKind::Function && def.start < line_no && line_no <= def.end)
+        .max_by_key(|def| def.indent)
+        .map(|def| def.end.saturating_sub(1).min(lines.len().saturating_sub(1)))
+        .unwrap_or_else(|| lines.len().saturating_sub(1))
 }
 
 fn logical_statement_end(lines: &[LineInfo], start_idx: usize) -> usize {
@@ -2421,6 +2454,41 @@ mod tests {
         let found = codes(source, false);
         assert!(!found.contains(&"SK403".to_string()));
         assert!(!found.contains(&"SK404".to_string()));
+    }
+
+    #[test]
+    fn sk507_does_not_treat_raises_call_as_raise_statement() {
+        let source = "def test_value():\n    raises(ValueError)\n";
+        assert!(!codes(source, true).contains(&"SK507".to_string()));
+    }
+
+    #[test]
+    fn sk507_still_accepts_raise_without_whitespace_before_expression() {
+        let source = "def public():\n    raise(ValueError())\n";
+        assert!(codes(source, true).contains(&"SK507".to_string()));
+    }
+
+    #[test]
+    fn sk801_counts_uses_across_the_remaining_lexical_scope() {
+        let source = r#"def rotate(v1, npv2):
+    attitude = make_attitude()
+    v2 = v1.rotate(attitude)
+    v3 = v2.rotate(attitude)
+    npv3 = np_rotate(npv2, attitude)
+    return v3, npv3
+"#;
+        let report = analyze(AnalysisInput {
+            path: PathBuf::from("example.py"),
+            source: source.to_string(),
+            vscode_config: VscodeConfig {
+                strict: Some(true),
+                ..VscodeConfig::default()
+            },
+        });
+        assert!(!report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SK801" && diagnostic.line == 2));
     }
 
     #[test]

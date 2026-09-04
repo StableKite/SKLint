@@ -2,6 +2,7 @@ use crate::analyzer::{analyze, AnalysisInput};
 use crate::config::VscodeConfig;
 use crate::diagnostic::{Diagnostic, Fix};
 use crate::identifier::is_identifier_continue;
+use crate::python_ast::PythonAst;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -12,9 +13,21 @@ pub struct FormatReport {
     /// Safe diagnostics that still remain after formatting.
     /// A non-zero value means the formatter could not reach a clean fixed point.
     pub remaining_safe: usize,
+    /// Formatting is fail-closed when the embedded parser cannot provide a
+    /// trustworthy full AST for the original source. No fixes are applied.
+    pub blocked_by_syntax: bool,
 }
 
 pub fn format_source(path: PathBuf, source: String, vscode_config: VscodeConfig) -> FormatReport {
+    if PythonAst::parse(&source, &path.display().to_string()).is_err() {
+        return FormatReport {
+            source,
+            applied: 0,
+            remaining_safe: 0,
+            blocked_by_syntax: true,
+        };
+    }
+
     let mut current = source;
     let mut total_applied = 0usize;
     let mut seen = HashSet::new();
@@ -112,6 +125,7 @@ pub fn format_source(path: PathBuf, source: String, vscode_config: VscodeConfig)
         source: current,
         applied: total_applied,
         remaining_safe,
+        blocked_by_syntax: false,
     }
 }
 
@@ -209,6 +223,7 @@ fn apply_ordering_fixes(source: &str, diagnostics: &[Diagnostic]) -> FormatRepor
             source: source.to_string(),
             applied: 0,
             remaining_safe: 0,
+            blocked_by_syntax: false,
         };
     }
 
@@ -236,6 +251,7 @@ fn apply_ordering_fixes(source: &str, diagnostics: &[Diagnostic]) -> FormatRepor
         },
         applied,
         remaining_safe: 0,
+        blocked_by_syntax: false,
     }
 }
 
@@ -1153,6 +1169,47 @@ mod tests {
     }
 
     #[test]
+    fn function_section_reorder_preserves_closing_docstring_indent_and_fixed_point() {
+        let source = r#"def f(arg1: str) -> bool:
+    """
+    Описание
+
+    Returns:
+        bool: Результат
+
+    Args:
+        arg1 (str): Аргумент
+    """
+
+    return True
+"#;
+        let first = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            VscodeConfig::default(),
+        );
+        let parsed = PythonAst::parse(&first.source, "example.py");
+        assert!(
+            parsed.is_ok(),
+            "formatter produced invalid Python: {}",
+            first.source
+        );
+        assert!(
+            first.source.find("    Args:").unwrap() < first.source.find("    Returns:").unwrap()
+        );
+        assert!(first.source.contains("    \"\"\"\n\n    return True"));
+
+        let second = format_source(
+            PathBuf::from("example.py"),
+            first.source.clone(),
+            VscodeConfig::default(),
+        );
+        assert_eq!(second.source, first.source);
+        assert_eq!(second.applied, 0);
+        assert!(!second.blocked_by_syntax);
+    }
+
+    #[test]
     fn reorders_top_level_definitions() {
         let source = "def build():\n    return Box()\n\nclass Box:\n    pass\n";
         let report = format_source(
@@ -1458,6 +1515,19 @@ def g(flag: str) -> str:
             formatter_docstring_style: style,
             ..VscodeConfig::default()
         }
+    }
+
+    #[test]
+    fn formatter_is_fail_closed_for_syntax_invalid_source() {
+        let source = "def f(:\n    x=1\n    return x\n";
+        let report = format_source(
+            PathBuf::from("invalid.py"),
+            source.to_string(),
+            VscodeConfig::default(),
+        );
+        assert_eq!(report.source, source);
+        assert_eq!(report.applied, 0);
+        assert!(report.blocked_by_syntax);
     }
 
     fn format_with_pydoclint_toml(source: &str, toml: &str) -> FormatReport {

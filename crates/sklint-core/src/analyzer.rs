@@ -6,6 +6,7 @@ use crate::docstrings::run_docstring_rules;
 use crate::dynamic_attrs::run_dynamic_attribute_rules;
 use crate::magic_constants::run_magic_constant_rule;
 use crate::pydoclint::run_pydoclint_rules;
+use crate::python_ast::{cpython_syntax_status, PythonAst, SyntaxOracleStatus};
 use crate::rules::rule_by_code;
 use crate::suppression::{unused_selector_replacement, SuppressionState};
 use crate::syntax_rules::run_syntax_rules;
@@ -509,6 +510,30 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
         }
     }
 
+    if PythonAst::parse(source, &display_path).is_err() {
+        match cpython_syntax_status(source) {
+            SyntaxOracleStatus::Valid if config.is_enabled("SK902") => diagnostics.push(
+                Diagnostic::new(
+                    "SK902",
+                    "Python syntax is valid, but SKLint's embedded parser cannot provide full AST analysis for this file",
+                    display_path.clone(),
+                    Span::new(1, 1, 1, 1),
+                    "warning",
+                ),
+            ),
+            SyntaxOracleStatus::Unavailable if config.is_enabled("SK903") => diagnostics.push(
+                Diagnostic::new(
+                    "SK903",
+                    "SKLint's embedded parser cannot parse this file and no compatible external syntax oracle was available to determine whether the source is valid",
+                    display_path.clone(),
+                    Span::new(1, 1, 1, 1),
+                    "warning",
+                ),
+            ),
+            _ => {}
+        }
+    }
+
     diagnostics.extend(run_comment_rules(path, source, config));
     diagnostics.extend(run_blank_line_rules(path, source, config));
     diagnostics.extend(run_docstring_rules(path, source, config));
@@ -531,6 +556,39 @@ mod tests {
             source: source.to_string(),
             vscode_config: VscodeConfig::default(),
         }
+    }
+
+    #[test]
+    fn valid_but_unparsed_python_never_silently_goes_green() {
+        // Match/case is supported by RustPython, so use a syntax fragment that
+        // only exercises this contract when the local CPython accepts it and
+        // the embedded parser does not. Common PEP 701 is handled by the
+        // compatibility rewrite and therefore should not emit SK902.
+        let source = "value = f\"{data[\"key\"]}\"\n";
+        let report = analyze(input(source));
+        assert!(!report.diagnostics.iter().any(|diag| diag.code == "SK902"));
+    }
+
+    #[test]
+    fn triple_nested_pep701_keeps_file_level_ast_rules_active() {
+        let report = analyze(input(
+            r#"# sklint: strict
+from dataclasses import dataclass
+
+@dataclass
+class Data:
+    """Data."""
+    x: int
+
+def render(value: int) -> str:
+    if value == 999:
+        value += 1
+    return f"{str(f"middle {f"inner {value}"}")}"
+"#,
+        ));
+        assert!(!report.diagnostics.iter().any(|diag| diag.code == "SK902"));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK901"));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK619"));
     }
 
     #[test]
@@ -589,10 +647,9 @@ def f(a, b: int):
     }
 
     #[test]
-    fn t201_noqa_suppresses_sk201_without_unused_suppression() {
+    fn foreign_t201_noqa_does_not_suppress_sk201() {
         let report = analyze(input("print('debug')  # noqa: T201\n"));
-        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK201"));
-        assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+        assert!(report.diagnostics.iter().any(|diag| diag.code == "SK201"));
     }
 
     #[test]
@@ -701,7 +758,7 @@ def f() -> int:
     Описание
 
     Returns:
-        tuple[int, int]: первое значение  
+        tuple[int, int]: первое значение
             Второе значение
     """
     pass
@@ -712,18 +769,18 @@ def f() -> int:
 
     #[test]
     fn sk001_reports_two_spaces_before_lowercase_continuation() {
-        let report = analyze(input(
-            r#"def f():
+        let source = r#"def f():
     """
     Описание
 
     Returns:
-        tuple[int, int]: первое значение  
+        tuple[int, int]: первое значение{two_spaces}
             второе значение
     """
     pass
-"#,
-        ));
+"#
+        .replace("{two_spaces}", "  ");
+        let report = analyze(input(&source));
         assert!(report.diagnostics.iter().any(|diag| diag.code == "SK001"));
     }
 

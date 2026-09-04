@@ -1,7 +1,7 @@
 use regex::Regex;
 use sklint_core::{
     analyze,
-    config::load_pyproject_for_file,
+    config::{load_pyproject_for_file, validate_selector},
     formatter::format_source,
     pydoclint::{
         validate_pydoclint_config_values_for_path, PydoclintNativeOptions, PydoclintOptions,
@@ -113,7 +113,15 @@ fn run() -> Result<i32, String> {
             Ok(0)
         }
         Some("--version") | Some("-V") => {
-            println!("sklint {}", env!("CARGO_PKG_VERSION"));
+            if args.next().as_deref() == Some("--verbose") {
+                print_build_info();
+            } else {
+                println!("sklint {}", env!("CARGO_PKG_VERSION"));
+            }
+            Ok(0)
+        }
+        Some("build-info") => {
+            print_build_info();
             Ok(0)
         }
         Some("--help") | Some("-h") | None => {
@@ -122,6 +130,16 @@ fn run() -> Result<i32, String> {
         }
         Some(other) => Err(format!("unknown command `{other}`. Use `sklint --help`.")),
     }
+}
+
+fn print_build_info() {
+    println!("sklint {}", env!("CARGO_PKG_VERSION"));
+    println!("revision: {}", env!("SKLINT_BUILD_REVISION"));
+    println!("source-tree-sha256: {}", env!("SKLINT_SOURCE_TREE_SHA256"));
+    println!("source-commit: {}", env!("SKLINT_SOURCE_COMMIT"));
+    println!("source-dirty: {}", env!("SKLINT_SOURCE_DIRTY"));
+    println!("rustc: {}", env!("SKLINT_RUSTC_VERSION"));
+    println!("target: {}", env!("SKLINT_BUILD_TARGET"));
 }
 
 fn parse_check_args(raw: Vec<String>) -> Result<CheckArgs, String> {
@@ -389,13 +407,16 @@ fn validate_explicit_config_path(path: &Path) -> Result<(), String> {
         ));
     }
     let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let has_pydoclint_section = text.lines().any(|raw| {
+    let has_sklint_config_section = text.lines().any(|raw| {
         let line = raw.split('#').next().unwrap_or("").trim();
-        matches!(line, "[tool.pydoclint]" | "[tool.sklint.pydoclint]")
+        matches!(
+            line,
+            "[tool.sklint]" | "[tool.pydoclint]" | "[tool.sklint.pydoclint]"
+        )
     });
-    if !has_pydoclint_section {
+    if !has_sklint_config_section {
         return Err(format!(
-            "explicit config file {} does not have a [tool.pydoclint] section",
+            "explicit config file {} does not have a [tool.sklint] section (legacy [tool.pydoclint] aliases are also accepted)",
             path.display()
         ));
     }
@@ -448,6 +469,7 @@ fn is_pydoclint_semantic_option(name: &str) -> bool {
             | "--omit-stars-when-documenting-varargs"
             | "-sdae"
             | "--should-declare-assert-error-if-assert-statement-exists"
+            | "--allow-documented-propagated-exceptions"
             | "-csm"
             | "--check-style-mismatch"
             | "-cad"
@@ -511,6 +533,9 @@ fn apply_pydoclint_semantic_option(
         "-sdae" | "--should-declare-assert-error-if-assert-statement-exists" => {
             bool_option!(should_declare_assert_error_if_assert_statement_exists)
         }
+        "--allow-documented-propagated-exceptions" => {
+            bool_option!(allow_documented_propagated_exceptions)
+        }
         "-csm" | "--check-style-mismatch" => bool_option!(check_style_mismatch),
         "-cad" | "--check-arg-defaults" => bool_option!(check_arg_defaults),
         "-nmnl" | "--native-mode-noqa-location" => {
@@ -540,6 +565,28 @@ fn parse_vscode_strict_value(value: &str, vscode_config: &mut VscodeConfig) -> R
 
 fn validate_pydoclint_semantics(path: &Path, vscode_config: &VscodeConfig) -> Result<(), String> {
     let project = load_pyproject_for_file(path);
+    if !project.errors.is_empty() {
+        let config_path = project
+            .found_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("pyproject.toml"));
+        return Err(format!(
+            "{}: invalid SKLint configuration: {}",
+            config_path.display(),
+            project.errors.join("; ")
+        ));
+    }
+    for (kind, selectors) in [
+        ("select", &vscode_config.select),
+        ("ignore", &vscode_config.ignore),
+    ] {
+        if let Some(selector) = selectors
+            .iter()
+            .find(|selector| !validate_selector(selector))
+        {
+            return Err(format!("invalid --vscode-{kind} selector `{selector}`"));
+        }
+    }
     let effective = EffectiveConfig::resolve(vscode_config, &project, &FileInlineConfig::default());
     validate_pydoclint_config_values_for_path(
         path,
@@ -683,11 +730,12 @@ fn run_check(args: CheckArgs) -> Result<i32, String> {
     let group_filenames = args.group_filenames
         || (native_options.show_filenames_configured
             && !native_options.show_filenames_in_every_violation_message);
-    match args.format {
+    let output_result = match args.format {
         OutputFormat::Text if group_filenames => print_text_grouped(&diagnostics),
         OutputFormat::Text => print_text(&diagnostics),
         OutputFormat::Json => print_json(&diagnostics),
-    }
+    };
+    ignore_broken_pipe(output_result)?;
 
     Ok(if diagnostics.is_empty() { 0 } else { 1 })
 }
@@ -926,6 +974,7 @@ fn run_format(args: FormatArgs) -> Result<i32, String> {
 
     let mut changed = Vec::new();
     let mut incomplete = Vec::new();
+    let mut syntax_blocked = Vec::new();
 
     for path in &args.paths {
         if path == Path::new("-") {
@@ -940,7 +989,11 @@ fn run_format(args: FormatArgs) -> Result<i32, String> {
             validate_pydoclint_semantics(&display_path, &shared_vscode_config)?;
             let report = format_source(display_path, source, shared_vscode_config.clone());
             print!("{}", report.source);
-            return Ok(if report.remaining_safe == 0 { 0 } else { 1 });
+            return Ok(if report.remaining_safe == 0 && !report.blocked_by_syntax {
+                0
+            } else {
+                1
+            });
         }
 
         for file in files_for_path(path)? {
@@ -948,6 +1001,9 @@ fn run_format(args: FormatArgs) -> Result<i32, String> {
             let source =
                 fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?;
             let report = format_source(file.clone(), source.clone(), shared_vscode_config.clone());
+            if report.blocked_by_syntax {
+                syntax_blocked.push(file.clone());
+            }
             if report.source != source {
                 changed.push(file.clone());
                 if !args.check {
@@ -980,11 +1036,22 @@ fn run_format(args: FormatArgs) -> Result<i32, String> {
                 );
             }
         }
-        Ok(if changed.is_empty() && incomplete.is_empty() {
-            0
-        } else {
-            1
-        })
+        for file in &syntax_blocked {
+            print_progress(
+                &format!(
+                    "{} cannot be formatted safely because full Python AST analysis is unavailable",
+                    file.display()
+                ),
+                args.progress_to_stderr,
+            );
+        }
+        Ok(
+            if changed.is_empty() && incomplete.is_empty() && syntax_blocked.is_empty() {
+                0
+            } else {
+                1
+            },
+        )
     } else {
         for file in &changed {
             print_progress(
@@ -1002,7 +1069,20 @@ fn run_format(args: FormatArgs) -> Result<i32, String> {
                 true,
             );
         }
-        Ok(if incomplete.is_empty() { 0 } else { 1 })
+        for file in &syntax_blocked {
+            print_progress(
+                &format!(
+                    "{} was not modified because full Python AST analysis is unavailable",
+                    file.display()
+                ),
+                true,
+            );
+        }
+        Ok(if incomplete.is_empty() && syntax_blocked.is_empty() {
+            0
+        } else {
+            1
+        })
     }
 }
 
@@ -1160,39 +1240,58 @@ fn is_py_file(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("py")
 }
 
-fn print_text(diagnostics: &[Diagnostic]) {
-    for diag in diagnostics {
-        println!(
-            "{}:{}:{}: {} {}",
-            diag.path, diag.line, diag.column, diag.code, diag.message
-        );
+fn ignore_broken_pipe(result: io::Result<()>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.to_string()),
     }
 }
 
-fn print_text_grouped(diagnostics: &[Diagnostic]) {
+fn print_text(diagnostics: &[Diagnostic]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for diag in diagnostics {
+        writeln!(
+            out,
+            "{}:{}:{}: {} {}",
+            diag.path, diag.line, diag.column, diag.code, diag.message
+        )?;
+    }
+    Ok(())
+}
+
+fn print_text_grouped(diagnostics: &[Diagnostic]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     let mut current_path: Option<&str> = None;
     for diag in diagnostics {
         if current_path != Some(diag.path.as_str()) {
             if current_path.is_some() {
-                println!();
+                writeln!(out)?;
             }
-            println!("{}", diag.path);
+            writeln!(out, "{}", diag.path)?;
             current_path = Some(diag.path.as_str());
         }
-        println!(
+        writeln!(
+            out,
             "    {}:{}: {} {}",
             diag.line, diag.column, diag.code, diag.message
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn print_json(diagnostics: &[Diagnostic]) {
-    print!("{{\"diagnostics\":[");
+fn print_json(diagnostics: &[Diagnostic]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write!(out, "{{\"diagnostics\":[")?;
     for (idx, diag) in diagnostics.iter().enumerate() {
         if idx > 0 {
-            print!(",");
+            write!(out, ",")?;
         }
-        print!(
+        write!(
+            out,
             "{{\"code\":\"{}\",\"message\":\"{}\",\"path\":\"{}\",\"line\":{},\"column\":{},\"end_line\":{},\"end_column\":{},\"level\":\"{}\"",
             json_escape(&diag.code),
             json_escape(&diag.message),
@@ -1202,12 +1301,13 @@ fn print_json(diagnostics: &[Diagnostic]) {
             diag.end_line,
             diag.end_column,
             json_escape(&diag.level),
-        );
+        )?;
         if let Some(line) = diag.suppression_line {
-            print!(",\"suppression_line\":{}", line);
+            write!(out, ",\"suppression_line\":{}", line)?;
         }
         if let Some(fix) = &diag.fix {
-            print!(
+            write!(
+                out,
                 ",\"fix\":{{\"safe\":{},\"message\":\"{}\",\"replacement\":\"{}\",\"start_line\":{},\"start_column\":{},\"end_line\":{},\"end_column\":{}}}",
                 fix.safe,
                 json_escape(&fix.message),
@@ -1216,11 +1316,12 @@ fn print_json(diagnostics: &[Diagnostic]) {
                 fix.start_column,
                 fix.end_line,
                 fix.end_column,
-            );
+            )?;
         }
-        print!("}}");
+        write!(out, "}}")?;
     }
-    println!("]}}");
+    writeln!(out, "]}}")?;
+    Ok(())
 }
 
 fn json_escape(text: &str) -> String {
@@ -1267,7 +1368,7 @@ fn explain(code: &str) {
         return;
     };
     println!(
-        "{} {}\n\n{}\n\nFull Markdown help: docs/rules.ru.md",
+        "{} {}\n\n{}\n\nFull Markdown help: https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md",
         rule.code, rule.name, rule.summary
     );
 }
@@ -1284,6 +1385,8 @@ Usage:
   sklint format --stdin-filename path/to/file.py -
   sklint rules
   sklint explain SK601
+  sklint --version [--verbose]
+  sklint build-info
 
 Core options:
   --format text|json                 Output format, default: text
@@ -1296,7 +1399,7 @@ Core options:
   --vscode-docstring-style STYLE     Editor fallback: google|numpy|sphinx
   --formatter-docstring-style STYLE  Formatter fallback: google|numpy|sphinx (default google)
 
-pydoclint-compatible config/native options:
+Docstring compatibility config/native options (legacy pydoclint names accepted):
   --config PATH                      Explicit TOML; CLI semantic options win over it
   --exclude REGEX                    Regex search against each POSIX file path
   --baseline PATH                    Ignore matching DOC/SKD baseline violations
@@ -1307,7 +1410,7 @@ pydoclint-compatible config/native options:
   -sfn, --show-filenames-in-every-violation-message[=BOOL]
   --group-filenames                  Group text diagnostics below each filename
 
-pydoclint semantic options:
+Docstring semantic options (legacy pydoclint names accepted):
   --style google|numpy|sphinx
   -aths, --arg-type-hints-in-signature BOOL
   -athd, --arg-type-hints-in-docstring BOOL
@@ -1330,6 +1433,7 @@ pydoclint semantic options:
   -sdsa, --should-document-star-arguments BOOL
   -oswdv, --omit-stars-when-documenting-varargs BOOL
   -sdae, --should-declare-assert-error-if-assert-statement-exists BOOL
+  --allow-documented-propagated-exceptions BOOL
   -csm, --check-style-mismatch BOOL
   -cad, --check-arg-defaults BOOL
   -nmnl, --native-mode-noqa-location definition|docstring
@@ -1360,6 +1464,12 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("sklint-cli-{name}-{unique}"))
+    }
+
+    #[test]
+    fn broken_pipe_on_stdout_is_not_a_cli_error() {
+        let error = io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed pipe");
+        assert!(ignore_broken_pipe(Err(error)).is_ok());
     }
 
     #[test]
@@ -1491,6 +1601,41 @@ mod tests {
     }
 
     #[test]
+    fn unknown_sklint_selector_in_project_config_is_rejected() {
+        let root = temp_path("unknown-sklint-selector");
+        fs::create_dir_all(&root).expect("mkdir");
+        let file = root.join("case.py");
+        fs::write(&file, "def f(v: int) -> bool:\n    return v == 999\n").expect("source");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = false\nselect = [\"SK999\"]\n",
+        )
+        .expect("config");
+        let error = validate_pydoclint_semantics(&file, &VscodeConfig::default())
+            .expect_err("unknown selector must fail");
+        assert!(error.contains("SK999"));
+        assert!(error.contains("invalid SKLint configuration"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_string_sklint_selector_array_is_rejected() {
+        let root = temp_path("wrong-type-sklint-selector");
+        fs::create_dir_all(&root).expect("mkdir");
+        let file = root.join("case.py");
+        fs::write(&file, "x = 1\n").expect("source");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nselect = [123]\n",
+        )
+        .expect("config");
+        let error = validate_pydoclint_semantics(&file, &VscodeConfig::default())
+            .expect_err("wrong selector type must fail");
+        assert!(error.contains("quoted strings"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn explicit_missing_config_is_rejected() {
         let missing = temp_path("missing.toml");
         let error = parse_check_args(vec![
@@ -1503,16 +1648,23 @@ mod tests {
     }
 
     #[test]
-    fn explicit_config_without_pydoclint_section_is_rejected() {
-        let path = temp_path("no-pydoclint.toml");
-        fs::write(&path, "[tool.sklint]\nstrict = true\n").expect("write config");
-        let error = parse_check_args(vec![
+    fn explicit_pure_sklint_config_is_accepted_without_legacy_pydoclint_section() {
+        let path = temp_path("pure-sklint.toml");
+        fs::write(
+            &path,
+            "[tool.sklint]\nstrict = true\nshould-document-private-class-attributes = true\n",
+        )
+        .expect("write config");
+        let args = parse_check_args(vec![
             "--config".into(),
             path.display().to_string(),
             "case.py".into(),
         ])
-        .expect_err("config without pydoclint section must fail");
-        assert!(error.contains("does not have a [tool.pydoclint] section"));
+        .expect("pure [tool.sklint] config must be accepted");
+        assert_eq!(
+            args.vscode_config.pydoclint_config_path.as_deref(),
+            Some(path.as_path())
+        );
         let _ = fs::remove_file(path);
     }
 

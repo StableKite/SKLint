@@ -27,6 +27,7 @@ pub struct PydoclintCliOverrides {
     pub should_document_star_arguments: Option<bool>,
     pub omit_stars_when_documenting_varargs: Option<bool>,
     pub should_declare_assert_error_if_assert_statement_exists: Option<bool>,
+    pub allow_documented_propagated_exceptions: Option<bool>,
     pub check_style_mismatch: Option<bool>,
     pub check_arg_defaults: Option<bool>,
     pub native_mode_noqa_location: Option<String>,
@@ -55,6 +56,10 @@ pub struct PyProjectConfig {
     pub ignore: Vec<String>,
     pub formatter_docstring_style: Option<DocStyle>,
     pub pydoclint_style: Option<DocStyle>,
+    /// Configuration errors discovered while parsing `[tool.sklint]`.
+    /// CLI entry points fail-fast on these instead of silently linting with
+    /// a partially applied configuration.
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -231,12 +236,7 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
     let mut upstream_pydoclint_style = None;
     let mut sklint_pydoclint_style = None;
 
-    for raw_line in text.lines() {
-        let line_without_comment = strip_toml_comment(raw_line).trim().to_string();
-        if line_without_comment.is_empty() {
-            continue;
-        }
-
+    for line_without_comment in logical_toml_lines(text) {
         if line_without_comment.starts_with('[') && line_without_comment.ends_with(']') {
             section = match line_without_comment.as_str() {
                 "[tool.sklint]" => {
@@ -257,12 +257,42 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
         let value = value.trim();
         match section {
             Section::Sklint => match key {
-                "strict" => config.strict = parse_bool(value),
-                "select" => config.select = parse_string_array(value),
-                "ignore" => config.ignore = parse_string_array(value),
+                "strict" => match parse_bool(value) {
+                    Some(parsed) => config.strict = Some(parsed),
+                    None => config.errors.push(format!(
+                        "[tool.sklint] strict must be a TOML boolean, got `{value}`"
+                    )),
+                },
+                "select" => match parse_string_array_checked(value) {
+                    Ok(parsed) => config.select = parsed,
+                    Err(message) => config
+                        .errors
+                        .push(format!("[tool.sklint] select {message}")),
+                },
+                "ignore" => match parse_string_array_checked(value) {
+                    Ok(parsed) => config.ignore = parsed,
+                    Err(message) => config
+                        .errors
+                        .push(format!("[tool.sklint] ignore {message}")),
+                },
                 "formatter-docstring-style" | "formatter_docstring_style" => {
-                    config.formatter_docstring_style = DocStyle::parse(trim_toml_string(value));
+                    match DocStyle::parse(trim_toml_string(value)) {
+                        Some(style) if is_quoted_toml_string(value) => {
+                            config.formatter_docstring_style = Some(style);
+                        }
+                        _ => config.errors.push(format!(
+                            "[tool.sklint] {key} must be one of 'google', 'numpy', 'sphinx' as a TOML string, got `{value}`"
+                        )),
+                    }
                 }
+                "style" => match DocStyle::parse(trim_toml_string(value)) {
+                    Some(style) if is_quoted_toml_string(value) => {
+                        sklint_pydoclint_style = Some(style);
+                    }
+                    _ => config.errors.push(format!(
+                        "[tool.sklint] style must be one of 'google', 'numpy', 'sphinx' as a TOML string, got `{value}`"
+                    )),
+                },
                 _ => {}
             },
             Section::Pydoclint if key.replace('-', "_").eq_ignore_ascii_case("style") => {
@@ -278,6 +308,10 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
     config.pydoclint_style = sklint_pydoclint_style.or(upstream_pydoclint_style);
     normalize_code_list(&mut config.select);
     normalize_code_list(&mut config.ignore);
+    validate_selectors("select", &config.select, &mut config.errors);
+    validate_selectors("ignore", &config.ignore, &mut config.errors);
+    config.errors.sort();
+    config.errors.dedup();
     config
 }
 
@@ -350,6 +384,13 @@ pub fn parse_csv_codes(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_quoted_toml_string(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
+}
+
 fn trim_toml_string(value: &str) -> &str {
     value.trim().trim_matches(|c| c == '"' || c == '\'')
 }
@@ -362,39 +403,172 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_string_array(value: &str) -> Vec<String> {
+fn parse_string_array_checked(value: &str) -> Result<Vec<String>, String> {
     let value = value.trim();
-    let value = value.strip_prefix('[').unwrap_or(value);
-    let value = value.strip_suffix(']').unwrap_or(value);
-    value
-        .split(',')
-        .map(|item| item.trim().trim_matches(|c| c == '"' || c == '\''))
-        .filter(|item| !item.is_empty())
-        .map(|item| item.to_ascii_uppercase())
-        .collect()
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return Err(format!("must be an array of strings, got `{value}`"));
+    };
+
+    let bytes = inner.as_bytes();
+    let mut index = 0usize;
+    let mut items = Vec::new();
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b',') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let quote = bytes[index];
+        if !matches!(quote, b'\'' | b'"') {
+            return Err(format!("must contain only quoted strings, got `{value}`"));
+        }
+        index += 1;
+        let start = index;
+        let mut escaped = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if quote == b'"' && escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            if quote == b'"' && byte == b'\\' {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if byte == quote {
+                break;
+            }
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return Err(format!("contains an unterminated string in `{value}`"));
+        }
+        let item = inner[start..index].trim();
+        if item.is_empty() {
+            return Err("must not contain empty selectors".to_string());
+        }
+        items.push(item.to_ascii_uppercase());
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] != b',' {
+            return Err(format!("must separate strings with commas, got `{value}`"));
+        }
+    }
+    Ok(items)
+}
+
+pub fn validate_selector(selector: &str) -> bool {
+    let selector = selector.trim().to_ascii_uppercase();
+    selector == "ALL"
+        || ALL_RULES
+            .iter()
+            .any(|rule| code_matches_selector(rule.code, &selector))
+}
+
+fn validate_selectors(kind: &str, selectors: &[String], errors: &mut Vec<String>) {
+    for selector in selectors {
+        if !validate_selector(selector) {
+            errors.push(format!(
+                "[tool.sklint] {kind} contains unknown selector `{selector}`"
+            ));
+        }
+    }
 }
 
 fn strip_toml_comment(line: &str) -> &str {
-    let mut in_string = false;
+    let mut quote = None;
     let mut escaped = false;
     for (idx, ch) in line.char_indices() {
         if escaped {
             escaped = false;
             continue;
         }
-        if ch == '\\' {
+        if quote == Some('"') && ch == '\\' {
             escaped = true;
             continue;
         }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if ch == '#' && !in_string {
-            return &line[..idx];
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch == '#' => return &line[..idx],
+            None => {}
         }
     }
     line
+}
+
+fn logical_toml_lines(text: &str) -> Vec<String> {
+    let raw_lines = text.lines().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+
+    while index < raw_lines.len() {
+        let first = strip_toml_comment(raw_lines[index]).trim();
+        index += 1;
+        if first.is_empty() {
+            continue;
+        }
+
+        let mut logical = first.to_string();
+        let starts_multiline_array = first
+            .split_once('=')
+            .map(|(_, value)| value.trim())
+            .is_some_and(|value| value.starts_with('[') && !toml_array_is_complete(value));
+        if starts_multiline_array {
+            while index < raw_lines.len() {
+                let continuation = strip_toml_comment(raw_lines[index]).trim();
+                index += 1;
+                if !continuation.is_empty() {
+                    logical.push(' ');
+                    logical.push_str(continuation);
+                }
+                let current_value = logical
+                    .split_once('=')
+                    .map(|(_, value)| value.trim())
+                    .unwrap_or("");
+                if toml_array_is_complete(current_value) {
+                    break;
+                }
+            }
+        }
+        out.push(logical);
+    }
+
+    out
+}
+
+fn toml_array_is_complete(value: &str) -> bool {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch == '[' => depth += 1,
+            None if ch == ']' => depth = depth.saturating_sub(1),
+            None => {}
+        }
+    }
+    depth == 0 && quote.is_none()
 }
 
 fn normalize_code_list(list: &mut Vec<String>) {
@@ -426,6 +600,73 @@ ignore = ["SK001"]
         assert_eq!(parsed.strict, Some(true));
         assert_eq!(parsed.select, vec!["SK101"]);
         assert_eq!(parsed.ignore, vec!["SK001"]);
+    }
+
+    #[test]
+    fn pyproject_parses_multiline_select_and_ignore_arrays() {
+        let parsed = parse_pyproject_toml(
+            r#"
+[tool.sklint]
+strict = false
+select = [
+    "SK901", # comparison policy
+    'SKD301',
+]
+ignore = [
+    "SK201",
+    'SK001', # trailing comma is valid TOML
+]
+"#,
+        );
+        assert_eq!(parsed.select, vec!["SK901", "SKD301"]);
+        assert_eq!(parsed.ignore, vec!["SK001", "SK201"]);
+    }
+
+    #[test]
+    fn toml_comments_inside_strings_are_preserved() {
+        assert_eq!(
+            strip_toml_comment("select = ['SK901#x'] # comment"),
+            "select = ['SK901#x'] "
+        );
+    }
+
+    #[test]
+    fn invalid_formatter_style_is_reported_instead_of_defaulting_silently() {
+        let parsed = parse_pyproject_toml("[tool.sklint]\nformatter-docstring-style = \"rest\"\n");
+        assert!(parsed.formatter_docstring_style.is_none());
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("formatter-docstring-style")));
+    }
+
+    #[test]
+    fn invalid_sklint_selector_is_reported_instead_of_failing_open() {
+        let parsed = parse_pyproject_toml("[tool.sklint]\nstrict = false\nselect = [\"SK999\"]\n");
+        assert!(parsed.select.contains(&"SK999".to_string()));
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("SK999")));
+    }
+
+    #[test]
+    fn non_string_selector_array_is_reported() {
+        let parsed = parse_pyproject_toml("[tool.sklint]\nselect = [123]\n");
+        assert!(parsed.select.is_empty());
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("quoted strings")));
+    }
+
+    #[test]
+    fn invalid_strict_type_is_reported() {
+        let parsed = parse_pyproject_toml("[tool.sklint]\nstrict = \"true\"\n");
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("TOML boolean")));
     }
 
     #[test]
@@ -485,6 +726,17 @@ ignore = ["SK001"]
             &FileInlineConfig::default(),
         );
         assert_eq!(config.formatter_docstring_style, DocStyle::Numpy);
+    }
+
+    #[test]
+    fn syntax_validity_gate_is_active_without_strict_project_config() {
+        let effective = EffectiveConfig::resolve(
+            &VscodeConfig::default(),
+            &PyProjectConfig::default(),
+            &FileInlineConfig::default(),
+        );
+        assert!(effective.is_enabled("SKD002"));
+        assert!(effective.is_enabled("SK903"));
     }
 
     #[test]

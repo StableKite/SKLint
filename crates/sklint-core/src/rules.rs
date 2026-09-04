@@ -384,7 +384,7 @@ pub const ALL_RULES: &[Rule] = &[
     Rule {
         code: "SKD002",
         name: "PythonSyntaxError",
-        level: RuleLevel::Strict,
+        level: RuleLevel::Normal,
         summary: "Syntax errors prevent Python AST analysis",
     },
     Rule {
@@ -639,6 +639,18 @@ pub const ALL_RULES: &[Rule] = &[
         level: RuleLevel::Strict,
         summary: "Magic numeric constants are forbidden outside self-documenting literal contexts",
     },
+    Rule {
+        code: "SK902",
+        name: "PartialAstAnalysis",
+        level: RuleLevel::Normal,
+        summary: "Python syntax is valid but the embedded parser cannot provide full AST coverage",
+    },
+    Rule {
+        code: "SK903",
+        name: "SyntaxOracleUnavailable",
+        level: RuleLevel::Normal,
+        summary: "Embedded parsing failed and an external syntax oracle was unavailable or timed out",
+    },
 ];
 
 pub fn rule_by_code(code: &str) -> Option<&'static Rule> {
@@ -654,10 +666,6 @@ pub fn code_matches_selector(code: &str, selector: &str) -> bool {
     if selector.is_empty() {
         return false;
     }
-    if code == "SK201" && selector == "T201" {
-        return true;
-    }
-
     let canonical_selector = doc_alias_to_skd(&selector);
     canonical_selector == "ALL"
         || code == canonical_selector
@@ -676,11 +684,9 @@ mod tests {
     use super::code_matches_selector;
 
     #[test]
-    fn t201_is_an_alias_only_for_sk201() {
-        assert!(code_matches_selector("SK201", "T201"));
+    fn foreign_t201_selector_is_not_owned_by_sklint() {
+        assert!(!code_matches_selector("SK201", "T201"));
         assert!(code_matches_selector("SK201", "SK201"));
-        assert!(!code_matches_selector("SK211", "T201"));
-        assert!(!code_matches_selector("SK201", "T20"));
     }
 
     #[test]

@@ -15,8 +15,9 @@ use crate::pydoclint_doc::{
     ParsedDocstring,
 };
 use crate::python_ast::{
-    expression_text, function_facts, source_text, string_constant, suite_docstring,
-    suite_docstring_stmt, FunctionFacts, PythonAst,
+    cpython_syntax_status, expression_text, function_facts, qualified_name, source_text,
+    string_constant, suite_docstring, suite_docstring_stmt, FunctionFacts, PythonAst,
+    SyntaxOracleStatus,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Stmt};
 use rustpython_parser::Parse;
@@ -54,6 +55,11 @@ pub struct PydoclintOptions {
     pub should_document_star_arguments: bool,
     pub omit_stars_when_documenting_varargs: bool,
     pub should_declare_assert_error_if_assert_statement_exists: bool,
+    /// Allow a documented Raises section on wrapper/delegating functions that
+    /// contain calls even when SKLint cannot statically prove the downstream
+    /// exception type.  Disabled by default to preserve pydoclint parity;
+    /// projects with intentional propagated-exception documentation can opt in.
+    pub allow_documented_propagated_exceptions: bool,
     pub check_style_mismatch: bool,
     pub check_arg_defaults: bool,
     pub native_mode_noqa_location: NoqaLocation,
@@ -98,12 +104,14 @@ impl PydoclintNativeOptions {
         };
         apply_native_toml_section(&mut options, &text, "tool.pydoclint");
         apply_native_toml_section(&mut options, &text, "tool.sklint.pydoclint");
+        apply_native_toml_section(&mut options, &text, "tool.sklint");
         options
     }
 
     pub fn apply_toml_text(&mut self, text: &str) {
         apply_native_toml_section(self, text, "tool.pydoclint");
         apply_native_toml_section(self, text, "tool.sklint.pydoclint");
+        apply_native_toml_section(self, text, "tool.sklint");
     }
 }
 
@@ -117,7 +125,7 @@ impl Default for PydoclintOptions {
             skip_checking_short_docstrings: true,
             skip_checking_raises: false,
             skip_checking_private_functions: false,
-            allow_init_docstring: false,
+            allow_init_docstring: true,
             check_return_types: true,
             check_yield_types: true,
             ignore_underscore_args: true,
@@ -132,6 +140,7 @@ impl Default for PydoclintOptions {
             should_document_star_arguments: true,
             omit_stars_when_documenting_varargs: false,
             should_declare_assert_error_if_assert_statement_exists: false,
+            allow_documented_propagated_exceptions: false,
             check_style_mismatch: false,
             check_arg_defaults: false,
             native_mode_noqa_location: NoqaLocation::Docstring,
@@ -202,6 +211,7 @@ impl PydoclintOptions {
     pub fn apply_toml_text(&mut self, text: &str) {
         apply_toml_section(self, text, "tool.pydoclint");
         apply_toml_section(self, text, "tool.sklint.pydoclint");
+        apply_toml_section(self, text, "tool.sklint");
     }
 
     pub fn apply_cli_overrides(&mut self, overrides: &PydoclintCliOverrides) {
@@ -235,6 +245,7 @@ impl PydoclintOptions {
         apply!(should_document_star_arguments);
         apply!(omit_stars_when_documenting_varargs);
         apply!(should_declare_assert_error_if_assert_statement_exists);
+        apply!(allow_documented_propagated_exceptions);
         apply!(check_style_mismatch);
         apply!(check_arg_defaults);
         if let Some(value) = overrides.native_mode_noqa_location.as_deref() {
@@ -364,31 +375,36 @@ pub fn run_pydoclint_rules(path: &Path, source: &str, config: &EffectiveConfig) 
                         ast
                     }
                     Err(second_error) => {
-                        if !config.is_enabled("SKD002") {
-                            return Vec::new();
-                        }
-                        return vec![Diagnostic::new(
-                            "SKD002",
-                            format!(
-                                "Syntax errors; cannot parse this Python file. Error message: {second_error}"
-                            ),
-                            display_path,
-                            Span::new(0, 1, 0, 1),
-                            "warning",
-                        )];
+                        return match cpython_syntax_status(source) {
+                            SyntaxOracleStatus::Invalid if config.is_enabled("SKD002") => vec![
+                                Diagnostic::new(
+                                    "SKD002",
+                                    format!(
+                                        "Syntax errors; cannot parse this Python file. Error message: {second_error}"
+                                    ),
+                                    display_path,
+                                    Span::new(1, 1, 1, 1),
+                                    "warning",
+                                ),
+                            ],
+                            SyntaxOracleStatus::Valid | SyntaxOracleStatus::Unavailable | SyntaxOracleStatus::Invalid => Vec::new(),
+                        };
                     }
                 }
             } else {
-                if !config.is_enabled("SKD002") {
-                    return Vec::new();
-                }
-                return vec![Diagnostic::new(
-                    "SKD002",
-                    format!("Syntax errors; cannot parse this Python file. Error message: {error}"),
-                    display_path,
-                    Span::new(0, 1, 0, 1),
-                    "warning",
-                )];
+                return match cpython_syntax_status(source) {
+                    SyntaxOracleStatus::Valid | SyntaxOracleStatus::Unavailable => Vec::new(),
+                    SyntaxOracleStatus::Invalid if config.is_enabled("SKD002") => vec![
+                        Diagnostic::new(
+                            "SKD002",
+                            format!("Syntax errors; cannot parse this Python file. Error message: {error}"),
+                            display_path,
+                            Span::new(1, 1, 1, 1),
+                            "warning",
+                        ),
+                    ],
+                    SyntaxOracleStatus::Invalid => Vec::new(),
+                };
             }
         }
     };
@@ -427,6 +443,17 @@ fn replace_invisible_chars(text: &str) -> String {
         .collect()
 }
 
+fn section_heading_already_present(literal: &str, section: &str) -> bool {
+    let Some(first_line) = section.lines().next() else {
+        return false;
+    };
+    let heading = first_line.trim();
+    if heading.is_empty() {
+        return false;
+    }
+    literal.lines().any(|line| line.trim() == heading)
+}
+
 impl<'a> Visitor<'a> {
     fn visit_statements(&mut self, body: &'a [Stmt], parent: ParentDef<'a>) {
         for stmt in body {
@@ -438,14 +465,24 @@ impl<'a> Visitor<'a> {
                 Stmt::FunctionDef(function) => {
                     let function = FunctionRef::Sync(function);
                     if !self.should_skip_function(function, parent) {
-                        self.check_function(function, parent);
+                        let effective_parent = if matches!(parent, ParentDef::Class(_)) {
+                            parent
+                        } else {
+                            self.dynamic_method_parent(body, function).unwrap_or(parent)
+                        };
+                        self.check_function(function, effective_parent);
                         self.visit_statements(function.body(), ParentDef::Function);
                     }
                 }
                 Stmt::AsyncFunctionDef(function) => {
                     let function = FunctionRef::Async(function);
                     if !self.should_skip_function(function, parent) {
-                        self.check_function(function, parent);
+                        let effective_parent = if matches!(parent, ParentDef::Class(_)) {
+                            parent
+                        } else {
+                            self.dynamic_method_parent(body, function).unwrap_or(parent)
+                        };
+                        self.check_function(function, effective_parent);
                         self.visit_statements(function.body(), ParentDef::Function);
                     }
                 }
@@ -495,6 +532,20 @@ impl<'a> Visitor<'a> {
         }
     }
 
+    fn dynamic_method_parent(
+        &self,
+        scope_body: &'a [Stmt],
+        function: FunctionRef<'a>,
+    ) -> Option<ParentDef<'a>> {
+        let class_name = dynamic_method_binding_class(scope_body, function.name())?;
+        scope_body.iter().find_map(|stmt| match stmt {
+            Stmt::ClassDef(class) if class.name.as_str() == class_name => {
+                Some(ParentDef::Class(class))
+            }
+            _ => None,
+        })
+    }
+
     fn should_skip_function(&self, function: FunctionRef<'a>, _parent: ParentDef<'a>) -> bool {
         self.options.skip_checking_private_functions && is_private_name(function.name())
     }
@@ -533,7 +584,7 @@ impl<'a> Visitor<'a> {
                 "SKD003",
                 line,
                 format!(
-                    "Function/method `{}`: Docstring style mismatch. (Please read more at https://jsh9.github.io/pydoclint/style_mismatch.html ). You specified \"{}\" style, but the docstring is likely not written in this style.",
+                    "Function/method `{}`: Docstring style mismatch. (Please read more at https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md ). You specified \"{}\" style, but the docstring is likely not written in this style.",
                     function.name(),
                     doc_style_name(self.options.style)
                 ),
@@ -776,7 +827,7 @@ impl<'a> Visitor<'a> {
                 "SKD103",
                 line,
                 format!(
-                    "{prefix}: Docstring arguments are different from function arguments. (Or could be other formatting issues: https://jsh9.github.io/pydoclint/violation_codes.html#notes-on-doc103 ). {}",
+                    "{prefix}: Docstring arguments are different from function arguments. (Or could be other formatting issues: https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md ). {}",
                     postfix.join(" ")
                 ),
                 suppression,
@@ -1174,13 +1225,26 @@ impl<'a> Visitor<'a> {
             );
         }
 
+        // Pure signature stubs (`...` / `pass`) intentionally describe the
+        // behavior of an implementation that is not present in this source
+        // file. Body-vs-doc Raises checks are therefore not meaningful for
+        // them (notably .pyi and TYPE_CHECKING signature stubs).
+        if is_stub_body(function.body()) {
+            return;
+        }
+
+        let has_allowed_propagation_path =
+            self.options.allow_documented_propagated_exceptions && facts.has_call;
         let no_runtime_exception_source = if self
             .options
             .should_declare_assert_error_if_assert_statement_exists
         {
-            !facts.has_assert && !facts.has_raise
+            !facts.has_assert
+                && !facts.has_raise
+                && !facts.has_implicit_exception_path
+                && !has_allowed_propagation_path
         } else {
-            !facts.has_raise
+            !facts.has_raise && !facts.has_implicit_exception_path && !has_allowed_propagation_path
         };
         if no_runtime_exception_source && doc.parsed.has_raises_section && !is_abstract(function) {
             self.push(
@@ -1211,7 +1275,38 @@ impl<'a> Visitor<'a> {
 
         // Upstream only emits DOC503 when a real `raise` statement exists.
         if facts.has_raise {
-            let mut actual = facts.raised_exceptions.clone();
+            let arg_types = collect_function_args(self.source, function, parent, &self.options)
+                .into_iter()
+                .filter(|arg| !arg.ty.is_empty())
+                .map(|arg| (arg.name.trim_start_matches('*').to_string(), arg.ty))
+                .collect::<HashMap<_, _>>();
+            let class_attr_types = match parent {
+                ParentDef::Class(class) => collect_class_annotation_types(self.source, &class.body),
+                ParentDef::Module | ParentDef::Function => HashMap::new(),
+            };
+            let local_instance_types = collect_local_instance_types(self.source, function.body());
+            let mut actual = facts
+                .raised_exceptions
+                .iter()
+                .map(|name| {
+                    if let Some(ty) = arg_types.get(name) {
+                        return ty.clone();
+                    }
+                    if let Some(attr) = name.strip_prefix("self.") {
+                        if let Some(ty) = class_attr_types.get(attr) {
+                            return exception_annotation_type(ty);
+                        }
+                    }
+                    if let Some((local, attr)) = name.split_once('.') {
+                        if let Some(class_name) = local_instance_types.get(local) {
+                            if let Some(ty) = self.local_class_attribute_type(class_name, attr) {
+                                return exception_annotation_type(&ty);
+                            }
+                        }
+                    }
+                    name.clone()
+                })
+                .collect::<Vec<_>>();
             if self
                 .options
                 .should_declare_assert_error_if_assert_statement_exists
@@ -1236,6 +1331,25 @@ impl<'a> Visitor<'a> {
                 );
             }
         }
+    }
+
+    fn local_class_attribute_type(&self, class_name: &str, attr: &str) -> Option<String> {
+        let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+        for stmt in &self.ast.suite {
+            let Stmt::ClassDef(class) = stmt else {
+                continue;
+            };
+            if class.name.as_str() != simple {
+                continue;
+            }
+            if let Some(ty) = collect_class_annotation_types(self.source, &class.body).get(attr) {
+                return Some(ty.clone());
+            }
+        }
+        self.dataclasses
+            .class(simple)
+            .and_then(|class| class.direct_fields.iter().find(|field| field.name == attr))
+            .map(|field| field.ty.clone())
     }
 
     fn check_class(&mut self, class: &'a ast::StmtClassDef) {
@@ -1285,35 +1399,6 @@ impl<'a> Visitor<'a> {
 
         self.apply_inline_attribute_docs(class, &actual, &mut documented, suppression);
 
-        if documented.len() < actual.len() {
-            let fix = (!doc.parsed.has_attributes_section
-                && !self.options.require_inline_class_var_docs
-                && !actual.is_empty())
-            .then(|| render_parameter_section(self.options.style, &actual, true))
-            .and_then(|section| self.append_docstring_section_fix(&class.body, &section));
-            self.push_with_fix(
-                "SKD601",
-                line,
-                format!(
-                    "Class `{}`: Class docstring contains fewer class attributes than actual class attributes.  (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)",
-                    class.name
-                ),
-                suppression,
-                fix,
-            );
-        }
-        if documented.len() > actual.len() {
-            self.push(
-                "SKD602",
-                line,
-                format!(
-                    "Class `{}`: Class docstring contains more class attributes than in actual class attributes.  (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)",
-                    class.name
-                ),
-                suppression,
-            );
-        }
-
         let actual_names = actual
             .iter()
             .map(|arg| arg.name.as_str())
@@ -1322,72 +1407,209 @@ impl<'a> Visitor<'a> {
             .iter()
             .map(|arg| arg.name.as_str())
             .collect::<Vec<_>>();
-        let same_unordered = same_string_set_with_equal_len(&actual_names, &doc_names);
-        if !same_unordered {
-            let mut missing = actual
+        let required_names = if !self
+            .options
+            .only_attrs_with_classvar_are_treated_as_class_attrs
+        {
+            self.dataclasses
+                .class(class.name.as_str())
+                .filter(|model_class| model_class.is_dataclass_like)
+                .map(|model_class| {
+                    model_class
+                        .direct_fields
+                        .iter()
+                        .filter(|field| {
+                            self.options.should_document_private_class_attributes
+                                || !field.name.starts_with('_')
+                        })
+                        .map(|field| field.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    actual_names
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect()
+                })
+        } else {
+            actual_names
                 .iter()
-                .filter(|arg| !documented.iter().any(|doc_arg| doc_arg.name == arg.name))
-                .map(format_actual_arg)
-                .collect::<Vec<_>>();
-            let mut extra = documented
+                .map(|name| (*name).to_string())
+                .collect()
+        };
+        let allows_inherited_omission = required_names.len() < actual_names.len()
+            && required_names
                 .iter()
-                .filter(|arg| !actual.iter().any(|actual_arg| actual_arg.name == arg.name))
-                .map(format_doc_item)
+                .all(|name| actual_names.contains(&name.as_str()));
+
+        if !allows_inherited_omission {
+            if documented.len() < actual.len() {
+                let fix = (!doc.parsed.has_attributes_section
+                    && !self.options.require_inline_class_var_docs
+                    && !actual.is_empty())
+                .then(|| render_parameter_section(self.options.style, &actual, true))
+                .and_then(|section| self.append_docstring_section_fix(&class.body, &section));
+                self.push_with_fix(
+                    "SKD601",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring contains fewer class attributes than actual class attributes.  (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)",
+                        class.name
+                    ),
+                    suppression,
+                    fix,
+                );
+            }
+            if documented.len() > actual.len() {
+                self.push(
+                    "SKD602",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring contains more class attributes than in actual class attributes.  (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)",
+                        class.name
+                    ),
+                    suppression,
+                );
+            }
+
+            let same_unordered = same_string_set_with_equal_len(&actual_names, &doc_names);
+            if !same_unordered {
+                let mut missing = actual
+                    .iter()
+                    .filter(|arg| !documented.iter().any(|doc_arg| doc_arg.name == arg.name))
+                    .map(format_actual_arg)
+                    .collect::<Vec<_>>();
+                let mut extra = documented
+                    .iter()
+                    .filter(|arg| !actual.iter().any(|actual_arg| actual_arg.name == arg.name))
+                    .map(format_doc_item)
+                    .collect::<Vec<_>>();
+                missing.sort();
+                extra.sort();
+                let mut postfix = Vec::new();
+                if !missing.is_empty() {
+                    let location = if self.options.require_inline_class_var_docs {
+                        "not documented inline"
+                    } else {
+                        "not in the docstring"
+                    };
+                    postfix.push(format!(
+                        "Attributes in the class definition but {location}: [{}].",
+                        missing.join(", ")
+                    ));
+                }
+                if !extra.is_empty() {
+                    postfix.push(format!(
+                        "Arguments in the docstring but not in the actual class attributes: [{}].",
+                        extra.join(", ")
+                    ));
+                }
+                self.push(
+                    "SKD603",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring attributes are different from actual class attributes. (Or could be other formatting issues: https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md ). {} (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)",
+                        class.name,
+                        postfix.join(" ")
+                    ),
+                    suppression,
+                );
+                return;
+            }
+            if self.options.check_arg_order && actual_names != doc_names {
+                let fix = self.reorder_docstring_items_fix(&class.body, true, &actual_names);
+                self.push_with_fix(
+                    "SKD604",
+                    line,
+                    format!(
+                        "Class `{}`: Attributes are the same in docstring and class def, but are in a different order.  (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)",
+                        class.name
+                    ),
+                    suppression,
+                    fix,
+                );
+            }
+        } else {
+            let missing = required_names
+                .iter()
+                .filter(|name| !doc_names.contains(&name.as_str()))
+                .cloned()
                 .collect::<Vec<_>>();
-            missing.sort();
-            extra.sort();
-            let mut postfix = Vec::new();
+            let extra = doc_names
+                .iter()
+                .filter(|name| !actual_names.contains(name))
+                .copied()
+                .collect::<Vec<_>>();
             if !missing.is_empty() {
-                let location = if self.options.require_inline_class_var_docs {
-                    "not documented inline"
-                } else {
-                    "not in the docstring"
-                };
-                postfix.push(format!(
-                    "Attributes in the class definition but {location}: [{}].",
-                    missing.join(", ")
-                ));
+                self.push(
+                    "SKD601",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring does not document subclass fields: [{}].",
+                        class.name,
+                        missing.join(", ")
+                    ),
+                    suppression,
+                );
             }
             if !extra.is_empty() {
-                postfix.push(format!(
-                    "Arguments in the docstring but not in the actual class attributes: [{}].",
-                    extra.join(", ")
-                ));
+                self.push(
+                    "SKD602",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring contains unknown attributes: [{}].",
+                        class.name,
+                        extra.join(", ")
+                    ),
+                    suppression,
+                );
             }
-            self.push(
-                "SKD603",
-                line,
-                format!(
-                    "Class `{}`: Class docstring attributes are different from actual class attributes. (Or could be other formatting issues: https://jsh9.github.io/pydoclint/violation_codes.html#notes-on-doc103 ). {} (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)",
-                    class.name,
-                    postfix.join(" ")
-                ),
-                suppression,
-            );
-            return;
-        }
-        if self.options.check_arg_order && actual_names != doc_names {
-            let fix = self.reorder_docstring_items_fix(&class.body, true, &actual_names);
-            self.push_with_fix(
-                "SKD604",
-                line,
-                format!(
-                    "Class `{}`: Attributes are the same in docstring and class def, but are in a different order.  (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)",
-                    class.name
-                ),
-                suppression,
-                fix,
-            );
+            if !missing.is_empty() || !extra.is_empty() {
+                self.push(
+                    "SKD603",
+                    line,
+                    format!(
+                        "Class `{}`: Class docstring attributes differ from required/actual fields. Missing subclass fields: [{}]. Unknown: [{}].",
+                        class.name,
+                        missing.join(", "),
+                        extra.join(", ")
+                    ),
+                    suppression,
+                );
+                return;
+            }
+            let expected_documented_order = actual_names
+                .iter()
+                .copied()
+                .filter(|name| doc_names.contains(name))
+                .collect::<Vec<_>>();
+            if self.options.check_arg_order && expected_documented_order != doc_names {
+                let fix = self.reorder_docstring_items_fix(&class.body, true, &actual_names);
+                self.push_with_fix(
+                    "SKD604",
+                    line,
+                    format!(
+                        "Class `{}`: Documented attributes are in a different order from the class field order.",
+                        class.name
+                    ),
+                    suppression,
+                    fix,
+                );
+            }
         }
 
         if (self.options.arg_type_hints_in_signature && self.options.arg_type_hints_in_docstring)
             || (self.options.check_arg_order && actual_names != doc_names)
         {
+            let is_ctypes_record = self.dataclasses.is_ctypes_record(class.name.as_str());
             let mismatches = actual
                 .iter()
                 .filter_map(|arg| {
                     let doc_arg = documented.iter().find(|doc_arg| doc_arg.name == arg.name)?;
-                    (!types_equal(&arg.ty, &doc_arg.ty)).then(|| arg.name.clone())
+                    let matches_public_type = types_equal(&arg.ty, &doc_arg.ty);
+                    let matches_storage_type = is_ctypes_record
+                        && ctypes_storage_type_matches(&class.body, &arg.name, &doc_arg.ty);
+                    (!(matches_public_type || matches_storage_type)).then(|| arg.name.clone())
                 })
                 .collect::<Vec<_>>();
             if !mismatches.is_empty() {
@@ -1396,16 +1618,21 @@ impl<'a> Visitor<'a> {
                     .filter(|arg| mismatches.contains(&arg.name) && !arg.ty.is_empty())
                     .map(|arg| (arg.name.clone(), arg.ty.clone()))
                     .collect::<Vec<_>>();
+                let ctypes_storage_only_mismatch = is_ctypes_record
+                    && mismatches
+                        .iter()
+                        .any(|name| !class_has_explicit_annotation(&class.body, name));
                 let fix = (self.options.arg_type_hints_in_signature
                     && self.options.arg_type_hints_in_docstring
-                    && desired.len() == mismatches.len())
-                .then(|| self.rewrite_named_docstring_types_fix(&class.body, true, &desired))
-                .flatten();
+                    && desired.len() == mismatches.len()
+                    && !ctypes_storage_only_mismatch)
+                    .then(|| self.rewrite_named_docstring_types_fix(&class.body, true, &desired))
+                    .flatten();
                 self.push_with_fix(
                     "SKD605",
                     line,
                     format!(
-                        "Class `{}`: Attribute names match, but type hints in these attributes do not match: {}  (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)",
+                        "Class `{}`: Attribute names match, but type hints in these attributes do not match: {}  (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)",
                         class.name,
                         mismatches.join(", ")
                     ),
@@ -1422,7 +1649,7 @@ impl<'a> Visitor<'a> {
             .only_attrs_with_classvar_are_treated_as_class_attrs
         {
             if let Some(model_class) = self.dataclasses.class(class.name.as_str()) {
-                if model_class.is_dataclass_like {
+                if model_class.processes_own_fields {
                     return self
                         .dataclasses
                         .effective_fields(class.name.as_str())
@@ -1439,7 +1666,24 @@ impl<'a> Visitor<'a> {
             }
         }
 
-        let mut actual = Vec::new();
+        let enum_value_type = self.dataclasses.enum_value_type(class.name.as_str());
+
+        let mut actual = if self
+            .options
+            .only_attrs_with_classvar_are_treated_as_class_attrs
+        {
+            Vec::new()
+        } else {
+            self.dataclasses
+                .inherited_annotated_fields(class.name.as_str())
+                .into_iter()
+                .filter(|field| {
+                    self.options.should_document_private_class_attributes
+                        || !field.name.starts_with('_')
+                })
+                .map(|field| dataclass_field_to_actual(field, self.options.check_arg_defaults))
+                .collect()
+        };
         for stmt in &class.body {
             match stmt {
                 Stmt::AnnAssign(assign) => {
@@ -1481,6 +1725,13 @@ impl<'a> Visitor<'a> {
                     for target in &assign.targets {
                         let before = actual.len();
                         collect_assignment_names(self.source, target, &mut actual);
+                        if let Some(value_type) = enum_value_type {
+                            for arg in &mut actual[before..] {
+                                if arg.ty.is_empty() {
+                                    arg.ty = value_type.to_string();
+                                }
+                            }
+                        }
                         if let (Some(default), Expr::Name(_)) = (default.as_deref(), target) {
                             for arg in &mut actual[before..] {
                                 append_default(&mut arg.ty, default);
@@ -1523,10 +1774,21 @@ impl<'a> Visitor<'a> {
                 _ => {}
             }
         }
-        if !self.options.should_document_private_class_attributes {
-            actual.retain(|arg| !arg.name.starts_with('_'));
+        if self.dataclasses.is_ctypes_record(class.name.as_str()) {
+            collect_ctypes_fields(&class.body, &mut actual);
         }
-        actual
+        let mut merged = Vec::<ActualArg>::new();
+        for arg in actual {
+            if let Some(existing) = merged.iter_mut().find(|item| item.name == arg.name) {
+                *existing = arg;
+            } else {
+                merged.push(arg);
+            }
+        }
+        if !self.options.should_document_private_class_attributes {
+            merged.retain(|arg| !arg.name.starts_with('_'));
+        }
+        merged
     }
 
     fn apply_inline_attribute_docs(
@@ -1633,20 +1895,17 @@ impl<'a> Visitor<'a> {
         let init_suppression = self.suppression_line(line, Some(init_doc.closing_line));
         if let Some(class_doc) = &class_doc {
             if let Some(error) = class_doc.parsed.parse_error.as_deref() {
-                let already_reported = self
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "SKD001" && diagnostic.line == class_line);
-                if !already_reported {
-                    self.push(
-                        "SKD001",
-                        class_line,
-                        format!(
-                            "Class `{class_name}`: Potential formatting errors in docstring. Error message: {error}"
-                        ),
-                        class_suppression,
-                    );
-                }
+                // Match pydoclint 0.9.1 exactly when init docstrings are allowed:
+                // the malformed class docstring is visited once as a class and
+                // once again while resolving the constructor documentation.
+                self.push(
+                    "SKD001",
+                    class_line,
+                    format!(
+                        "Class `{class_name}`: Potential formatting errors in docstring. Error message: {error}"
+                    ),
+                    class_suppression,
+                );
                 // The class-side structure is unreliable. Continue with the
                 // separate __init__ docstring, but do not emit class structural
                 // diagnostics from a broken parse.
@@ -1798,6 +2057,9 @@ impl<'a> Visitor<'a> {
         let stmt = suite_docstring_stmt(body)?;
         let literal = source_text(self.source, stmt);
         if !literal.contains('\n') {
+            return None;
+        }
+        if section_heading_already_present(literal, section) {
             return None;
         }
 
@@ -1969,10 +2231,161 @@ impl<'a> Visitor<'a> {
             "SKD405",
             line,
             format!(
-                "{prefix} has both \"return\" and \"yield\" statements. Please use Generator[YieldType, SendType, ReturnType] as the return type annotation, and put your yield type in YieldType and return type in ReturnType. More details in https://jsh9.github.io/pydoclint/notes_generator_vs_iterator.html"
+                "{prefix} has both \"return\" and \"yield\" statements. Please use Generator[YieldType, SendType, ReturnType] as the return type annotation, and put your yield type in YieldType and return type in ReturnType. More details in https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md"
             ),
             suppression,
         );
+    }
+}
+
+fn collect_ctypes_fields(body: &[Stmt], actual: &mut Vec<ActualArg>) {
+    for stmt in body {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        if !assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(name) if name.id.as_str() == "_fields_"))
+        {
+            continue;
+        }
+        let values = match assign.value.as_ref() {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            _ => continue,
+        };
+        for value in values {
+            let pair = match value {
+                Expr::Tuple(tuple) => &tuple.elts,
+                Expr::List(list) => &list.elts,
+                _ => continue,
+            };
+            if pair.len() < 2 {
+                continue;
+            }
+            let Some(name) = string_constant(&pair[0]) else {
+                continue;
+            };
+            let storage_type = canonical_ctypes_storage_type(&pair[1]);
+            if let Some(existing) = actual.iter_mut().find(|arg| arg.name == name) {
+                // Explicit Python annotations describe the public/runtime
+                // interface and must win over raw C storage declarations.
+                if existing.ty.is_empty() {
+                    existing.ty = storage_type;
+                }
+            } else {
+                actual.push(ActualArg {
+                    name: name.to_string(),
+                    ty: storage_type,
+                });
+            }
+        }
+    }
+}
+
+fn ctypes_storage_type_matches(body: &[Stmt], wanted: &str, documented_type: &str) -> bool {
+    for stmt in body {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        if !assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(name) if name.id.as_str() == "_fields_"))
+        {
+            continue;
+        }
+        let values = match assign.value.as_ref() {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            _ => continue,
+        };
+        for value in values {
+            let pair = match value {
+                Expr::Tuple(tuple) => &tuple.elts,
+                Expr::List(list) => &list.elts,
+                _ => continue,
+            };
+            if pair.len() < 2 || string_constant(&pair[0]) != Some(wanted) {
+                continue;
+            }
+            let raw_storage = canonical_expression_text(&pair[1]);
+            if types_equal(&raw_storage, documented_type) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn class_has_explicit_annotation(body: &[Stmt], wanted: &str) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::AnnAssign(assign) => matches!(
+            assign.target.as_ref(),
+            Expr::Name(name) if name.id.as_str() == wanted
+        ),
+        Stmt::If(node) if is_type_checking_expr(&node.test) => {
+            class_has_explicit_annotation(&node.body, wanted)
+                || class_has_explicit_annotation(&node.orelse, wanted)
+        }
+        _ => false,
+    })
+}
+
+fn canonical_ctypes_storage_type(expr: &Expr) -> String {
+    if let Expr::Call(call) = expr {
+        if call.args.len() == 1 && call.keywords.is_empty() {
+            if let Some(name) = qualified_name(&call.func) {
+                if name == "POINTER" || name.ends_with(".POINTER") {
+                    return format!("{name}[{}]", canonical_expression_text(&call.args[0]));
+                }
+            }
+        }
+    }
+
+    // ctypes arrays are declared as `ElementType * N`, while user-facing
+    // documentation naturally describes the runtime value as an Array of the
+    // element ctypes type. The size is storage/layout information rather than
+    // part of the public Python value type.
+    if let Expr::BinOp(binop) = expr {
+        if matches!(binop.op, ast::Operator::Mult) {
+            // ctypes arrays are type multiplications.  The right-hand side is
+            // layout metadata and may be a literal, a module constant, Final,
+            // or an arbitrary constant expression.  SKD605 compares the
+            // public element type, so the exact length expression is irrelevant.
+            let element = if is_integer_literal(binop.left.as_ref()) {
+                binop.right.as_ref()
+            } else {
+                binop.left.as_ref()
+            };
+            return format!("Array[{}]", canonical_expression_text(element));
+        }
+    }
+
+    if let Some(name) = qualified_name(expr) {
+        if let Some(public_type) = ctypes_scalar_public_type(&name) {
+            return public_type.to_string();
+        }
+    }
+
+    canonical_expression_text(expr)
+}
+
+fn is_integer_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Constant(node) if matches!(&node.value, Constant::Int(_)))
+}
+
+fn ctypes_scalar_public_type(name: &str) -> Option<&'static str> {
+    let name = name.rsplit('.').next().unwrap_or(name);
+    match name {
+        "c_byte" | "c_ubyte" | "c_short" | "c_ushort" | "c_int" | "c_uint" | "c_long"
+        | "c_ulong" | "c_longlong" | "c_ulonglong" | "c_ssize_t" | "c_size_t" => Some("int"),
+        "c_float" | "c_double" | "c_longdouble" => Some("float"),
+        "c_bool" => Some("bool"),
+        "c_char" => Some("bytes"),
+        "c_wchar" => Some("str"),
+        _ => None,
     }
 }
 
@@ -2915,6 +3328,201 @@ fn replace_tuple_bracket(text: &str) -> String {
     out
 }
 
+fn dynamic_method_binding_class<'a>(body: &'a [Stmt], function_name: &str) -> Option<&'a str> {
+    for stmt in body {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        if !matches!(assign.value.as_ref(), Expr::Name(name) if name.id.as_str() == function_name) {
+            continue;
+        }
+        for target in &assign.targets {
+            let Expr::Attribute(attribute) = target else {
+                continue;
+            };
+            let Expr::Name(class_name) = attribute.value.as_ref() else {
+                continue;
+            };
+            if matches!(attribute.attr.as_str(), "__init__" | "__new__" | "__call__") {
+                return Some(class_name.id.as_str());
+            }
+        }
+    }
+    None
+}
+
+fn collect_class_annotation_types(source: &str, body: &[Stmt]) -> HashMap<String, String> {
+    fn visit_instance_annotations(source: &str, body: &[Stmt], out: &mut HashMap<String, String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::AnnAssign(assign) => {
+                    let Expr::Attribute(attr) = assign.target.as_ref() else {
+                        continue;
+                    };
+                    if matches!(attr.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+                    {
+                        out.insert(
+                            attr.attr.to_string(),
+                            return_annotation_text(source, &assign.annotation),
+                        );
+                    }
+                }
+                Stmt::If(node) => {
+                    visit_instance_annotations(source, &node.body, out);
+                    visit_instance_annotations(source, &node.orelse, out);
+                }
+                Stmt::For(node) => {
+                    visit_instance_annotations(source, &node.body, out);
+                    visit_instance_annotations(source, &node.orelse, out);
+                }
+                Stmt::While(node) => {
+                    visit_instance_annotations(source, &node.body, out);
+                    visit_instance_annotations(source, &node.orelse, out);
+                }
+                Stmt::With(node) => visit_instance_annotations(source, &node.body, out),
+                Stmt::Try(node) => {
+                    visit_instance_annotations(source, &node.body, out);
+                    visit_instance_annotations(source, &node.orelse, out);
+                    visit_instance_annotations(source, &node.finalbody, out);
+                    for handler in &node.handlers {
+                        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                        visit_instance_annotations(source, &handler.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn visit(source: &str, body: &[Stmt], out: &mut HashMap<String, String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::AnnAssign(assign) => {
+                    if let Expr::Name(name) = assign.target.as_ref() {
+                        out.insert(
+                            name.id.to_string(),
+                            return_annotation_text(source, &assign.annotation),
+                        );
+                    }
+                }
+                Stmt::If(node) if is_type_checking_expr(&node.test) => {
+                    visit(source, &node.body, out);
+                    visit(source, &node.orelse, out);
+                }
+                Stmt::FunctionDef(function)
+                    if matches!(
+                        function.name.as_str(),
+                        "__init__" | "__post_init__" | "__setstate__"
+                    ) =>
+                {
+                    visit_instance_annotations(source, &function.body, out);
+                }
+                Stmt::AsyncFunctionDef(function)
+                    if matches!(
+                        function.name.as_str(),
+                        "__init__" | "__post_init__" | "__setstate__"
+                    ) =>
+                {
+                    visit_instance_annotations(source, &function.body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    visit(source, body, &mut out);
+    out
+}
+
+fn collect_local_instance_types(source: &str, body: &[Stmt]) -> HashMap<String, String> {
+    fn visit(source: &str, body: &[Stmt], out: &mut HashMap<String, String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(assign) => {
+                    let Expr::Call(call) = assign.value.as_ref() else {
+                        continue;
+                    };
+                    let Some(class_name) = qualified_name(&call.func) else {
+                        continue;
+                    };
+                    for target in &assign.targets {
+                        if let Expr::Name(name) = target {
+                            out.insert(name.id.to_string(), class_name.clone());
+                        }
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let Expr::Name(name) = assign.target.as_ref() {
+                        out.insert(
+                            name.id.to_string(),
+                            return_annotation_text(source, &assign.annotation),
+                        );
+                    }
+                }
+                Stmt::If(node) => {
+                    visit(source, &node.body, out);
+                    visit(source, &node.orelse, out);
+                }
+                Stmt::For(node) => {
+                    visit(source, &node.body, out);
+                    visit(source, &node.orelse, out);
+                }
+                Stmt::While(node) => {
+                    visit(source, &node.body, out);
+                    visit(source, &node.orelse, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    visit(source, body, &mut out);
+    out
+}
+
+fn is_stub_body(body: &[Stmt]) -> bool {
+    let body = if body.first().is_some_and(
+        |stmt| matches!(stmt, Stmt::Expr(expr) if string_constant(&expr.value).is_some()),
+    ) {
+        &body[1..]
+    } else {
+        body
+    };
+    matches!(
+        body,
+        [Stmt::Expr(expr)]
+            if matches!(expr.value.as_ref(), Expr::Constant(constant) if matches!(constant.value, Constant::Ellipsis))
+    )
+}
+
+fn is_type_checking_expr(expr: &Expr) -> bool {
+    qualified_name(expr)
+        .as_deref()
+        .is_some_and(|name| name == "TYPE_CHECKING" || name.ends_with(".TYPE_CHECKING"))
+}
+
+fn exception_annotation_type(text: &str) -> String {
+    let normalized = strip_outer_forward_reference_quotes(text).trim();
+    if let Some(inner) = normalized
+        .strip_prefix("Optional[")
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        return inner.trim().to_string();
+    }
+    let parts = normalized
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !matches!(*part, "None" | "NoneType"))
+        .collect::<Vec<_>>();
+    if parts.len() == 1 {
+        parts[0].to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
 fn return_annotation_text(source: &str, expr: &Expr) -> String {
     upstream_strip_quotes(&canonical_annotation_text(source, expr))
 }
@@ -2935,9 +3543,31 @@ fn canonical_subscript_slice_text(source: &str, expr: &Expr) -> String {
 }
 
 fn types_equal(left: &str, right: &str) -> bool {
+    // A quoted annotation such as `other: "Vector2 | NumberType"` is a
+    // forward reference. CPython/pydoclint compares its contained type text
+    // with an unquoted docstring spelling, so the quotes around the *entire*
+    // annotation must not participate in SKD105 equality. Strip only one
+    // matching outer quote pair here; quotes nested inside real type
+    // expressions (for example Literal["x"]) remain untouched.
+    let left = strip_outer_forward_reference_quotes(left);
+    let right = strip_outer_forward_reference_quotes(right);
     let left = upstream_strip_quotes(&normalize_type_text(left));
     let right = upstream_strip_quotes(&normalize_type_text(right));
     upstream_special_equal(&left, &right)
+}
+
+fn strip_outer_forward_reference_quotes(text: &str) -> &str {
+    let text = text.trim();
+    if text.len() < 2 {
+        return text;
+    }
+    if (text.starts_with('\'') && text.ends_with('\''))
+        || (text.starts_with('"') && text.ends_with('"'))
+    {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
 }
 
 fn upstream_strip_quotes(text: &str) -> String {
@@ -3589,6 +4219,10 @@ pub fn validate_pydoclint_config_values_for_path(
         "should_declare_assert_error_if_assert_statement_exists",
         overrides.should_declare_assert_error_if_assert_statement_exists
     );
+    validate_bool!(
+        "allow_documented_propagated_exceptions",
+        overrides.allow_documented_propagated_exceptions
+    );
     validate_bool!("check_style_mismatch", overrides.check_style_mismatch);
     validate_bool!("check_arg_defaults", overrides.check_arg_defaults);
 
@@ -3619,11 +4253,12 @@ fn update_validated_config_values(text: &str, values: &mut HashMap<String, Strin
         "should_document_star_arguments",
         "omit_stars_when_documenting_varargs",
         "should_declare_assert_error_if_assert_statement_exists",
+        "allow_documented_propagated_exceptions",
         "check_style_mismatch",
         "check_arg_defaults",
         "native_mode_noqa_location",
     ];
-    for section in ["tool.pydoclint", "tool.sklint.pydoclint"] {
+    for section in ["tool.pydoclint", "tool.sklint.pydoclint", "tool.sklint"] {
         for key in VALIDATED_KEYS {
             if let Some(value) = toml_section_scalar(text, section, key) {
                 values.insert((*key).to_string(), value);
@@ -3786,6 +4421,9 @@ fn apply_toml_section(options: &mut PydoclintOptions, text: &str, section: &str)
                 &mut options.should_declare_assert_error_if_assert_statement_exists,
                 value,
             ),
+            "allow_documented_propagated_exceptions" => {
+                set_bool(&mut options.allow_documented_propagated_exceptions, value)
+            }
             "check_style_mismatch" => set_bool(&mut options.check_style_mismatch, value),
             "check_arg_defaults" => set_bool(&mut options.check_arg_defaults, value),
             "native_mode_noqa_location" => {
@@ -4172,7 +4810,7 @@ def f(value: dict[str, list[int]]) -> None:
     }
 
     #[test]
-    fn inherited_dataclass_fields_feed_doc601_family() {
+    fn inherited_dataclass_fields_do_not_require_subclass_duplication() {
         let source = r#"
 from dataclasses import dataclass
 
@@ -4203,8 +4841,8 @@ class Child(Parent):
     child: str
 "#;
         let codes = codes(source);
-        assert!(codes.contains(&"SKD601".to_string()));
-        assert!(codes.contains(&"SKD603".to_string()));
+        assert!(!codes.contains(&"SKD601".to_string()));
+        assert!(!codes.contains(&"SKD603".to_string()));
     }
 
     #[test]
@@ -4277,6 +4915,556 @@ def f() -> None:
 "#;
         let codes = codes(source);
         assert!(!codes.contains(&"SKD503".to_string()));
+    }
+
+    #[test]
+    fn ordinary_subclass_of_dataclass_merges_inherited_and_own_attributes() {
+        let source = r#"from dataclasses import dataclass
+
+@dataclass
+class Base:
+    """Base.
+
+    Attributes:
+        x (int): X.
+    """
+    x: int = 1
+
+class Child(Base):
+    """Child.
+
+    Attributes:
+        x (int): X.
+        y (int): Y.
+    """
+    y: int = 2
+"#;
+        let diagnostics = diagnostics_with_options(source, "style = 'google'");
+        assert!(!diagnostics
+            .iter()
+            .any(|diag| matches!(diag.code.as_str(), "SKD603" | "SKD605")));
+    }
+
+    #[test]
+    fn indirect_intenum_and_direct_strenum_members_get_value_types() {
+        let source = r#"from enum import IntEnum, StrEnum
+
+class Custom(IntEnum):
+    pass
+
+class Mode(Custom):
+    """Mode.
+
+    Attributes:
+        A (int): A.
+    """
+    A = 1
+
+class TextMode(StrEnum):
+    """Text mode.
+
+    Attributes:
+        A (str): A.
+    """
+    A = "a"
+"#;
+        let diagnostics = diagnostics_with_options(source, "style = 'google'");
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn native_tool_sklint_semantic_options_are_first_class() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-native-semantic-{unique}"));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstyle = 'google'\nshould-document-private-class-attributes = true\n",
+        )
+        .expect("config");
+        let path = root.join("case.py");
+        fs::write(&path, "x = 1\n").expect("source");
+        let options = PydoclintOptions::load_for_path(&path);
+        assert_eq!(options.style, DocStyle::Google);
+        assert!(options.should_document_private_class_attributes);
+
+        let explicit = root.join("explicit.toml");
+        fs::write(
+            &explicit,
+            "[tool.sklint]\nallow-init-docstring = false\ncheck-return-types = false\n",
+        )
+        .expect("explicit config");
+        let explicit_options = PydoclintOptions::load_for_path_with_config(
+            &path,
+            DocStyle::Google,
+            Some(&explicit),
+            &PydoclintCliOverrides::default(),
+        );
+        assert!(!explicit_options.allow_init_docstring);
+        assert!(!explicit_options.check_return_types);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dynamic_init_binding_uses_method_argument_semantics() {
+        let source = r#"
+class C:
+    pass
+
+def ctor(self: C, value: int) -> None:
+    """Initialize.
+
+    Parameters
+    ----------
+    value : int
+        Value.
+    """
+    self.value = value
+
+C.__init__ = ctor
+"#;
+        let codes = codes(source);
+        assert!(!codes.contains(&"SKD101".to_string()));
+        assert!(!codes.contains(&"SKD103".to_string()));
+    }
+
+    #[test]
+    fn dynamic_init_binding_inside_function_uses_method_argument_semantics() {
+        let source = r#"
+def outer() -> None:
+    class C:
+        pass
+
+    def ctor(self: C, value: int) -> None:
+        """Initialize.
+
+        Parameters
+        ----------
+        value : int
+            Value.
+        """
+        self.value = value
+
+    C.__init__ = ctor
+"#;
+        let codes = codes(source);
+        assert!(!codes.contains(&"SKD101".to_string()));
+        assert!(!codes.contains(&"SKD103".to_string()));
+    }
+
+    #[test]
+    fn typed_self_attribute_exception_matches_raise() {
+        let source = r#"
+class C:
+    _error: ValueError | None
+
+    def run(self) -> None:
+        """Summary.
+
+        Raises
+        ------
+        ValueError
+            Stored error.
+        """
+        if self._error is not None:
+            raise self._error
+"#;
+        assert!(!codes(source).contains(&"SKD503".to_string()));
+    }
+
+    #[test]
+    fn pep695_parameterized_base_keeps_inherited_class_attributes() {
+        let source = r#"
+class Base[T]:
+    """Base.
+
+    Attributes
+    ----------
+    x : T
+        X.
+    y : int
+        Y.
+    """
+    x: T
+    y: int = 0
+
+class Child(Base[int]):
+    """Child.
+
+    Attributes
+    ----------
+    x : int
+        X.
+    y : int
+        Y.
+    """
+    x: int = 0
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics
+            .iter()
+            .any(|diag| matches!(diag.code.as_str(), "SKD602" | "SKD603")));
+    }
+
+    #[test]
+    fn typed_exception_parameter_matches_variable_raise() {
+        let source = r#"
+def fail(error: ValueError) -> None:
+    """Summary.
+
+    Raises
+    ------
+    ValueError
+        Forwarded error.
+    """
+    raise error
+"#;
+        assert!(!codes(source).contains(&"SKD503".to_string()));
+    }
+
+    #[test]
+    fn implicit_exception_path_does_not_make_raises_section_redundant() {
+        let source = r#"
+def inverse(value: float) -> float:
+    """Summary.
+
+    Raises
+    ------
+    ZeroDivisionError
+        Value is zero.
+    """
+    return 1 / value
+"#;
+        assert!(!codes(source).contains(&"SKD502".to_string()));
+    }
+
+    #[test]
+    fn propagated_exception_docs_can_be_enabled_explicitly_for_wrappers() {
+        let source = r#"
+def helper() -> None:
+    raise ValueError("x")
+
+def wrapper() -> None:
+    """Summary.
+
+    Raises
+    ------
+    ValueError
+        Propagated from helper.
+    """
+    helper()
+"#;
+
+        assert!(codes(source).contains(&"SKD502".to_string()));
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false\nallow-documented-propagated-exceptions = true",
+        );
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD502"));
+    }
+
+    #[test]
+    fn intenum_members_are_typed_as_int_for_attribute_docs() {
+        let source = r#"
+from enum import IntEnum
+
+class Mode(IntEnum):
+    """Summary.
+
+    Attributes
+    ----------
+    A : int
+        A.
+    B : int
+        B.
+    """
+
+    A = 1
+    B = 2
+"#;
+        assert!(!codes(source).contains(&"SKD605".to_string()));
+    }
+
+    #[test]
+    fn ctypes_explicit_python_annotation_wins_over_storage_type() {
+        let source = r#"
+from ctypes import Structure, c_ubyte
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : int
+        Value.
+    """
+
+    value: int
+    _fields_ = [("value", c_ubyte)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn ctypes_pointer_storage_type_normalizes_call_to_doc_brackets() {
+        let source = r#"
+from ctypes import POINTER, Structure, c_uint8
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    p : POINTER[c_uint8]
+        Pointer.
+    """
+
+    _fields_ = [("p", POINTER(c_uint8))]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn ctypes_storage_only_type_mismatch_is_not_safe_fix() {
+        let source = r#"
+from ctypes import Structure, c_void_p
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : int
+        Value.
+    """
+
+    _fields_ = [("value", c_void_p)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diag| diag.code == "SKD605")
+            .expect("ctypes storage/public type ambiguity should remain visible");
+        assert!(
+            diagnostic.fix.is_none(),
+            "ambiguous ctypes storage types are not safe doc fixes"
+        );
+    }
+
+    #[test]
+    fn ctypes_unannotated_scalar_uses_python_runtime_public_type() {
+        let source = r#"
+from ctypes import Structure, c_uint
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : int
+        Value.
+    """
+
+    _fields_ = [("value", c_uint)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn ctypes_array_storage_normalizes_to_array_element_type() {
+        let source = r#"
+from ctypes import Array, Structure, c_ubyte
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : Array[c_ubyte]
+        Value.
+    """
+
+    _fields_ = [("value", c_ubyte * 8)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn ctypes_array_storage_accepts_nonliteral_length_expressions() {
+        let cases = [
+            r#"
+from ctypes import Array, Structure, c_ubyte
+
+N = 8
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : Array[c_ubyte]
+        Value.
+    """
+
+    _fields_ = [("value", c_ubyte * N)]
+"#,
+            r#"
+from ctypes import Array, Structure, c_ubyte
+from typing import Final
+
+N: Final[int] = 8
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : Array[c_ubyte]
+        Value.
+    """
+
+    _fields_ = [("value", c_ubyte * N)]
+"#,
+            r#"
+from ctypes import Array, Structure, c_ubyte
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : Array[c_ubyte]
+        Value.
+    """
+
+    _fields_ = [("value", c_ubyte * (4 * 2))]
+"#,
+        ];
+
+        for source in cases {
+            let diagnostics = diagnostics_with_options(
+                source,
+                "style = 'numpy'\nskip-checking-short-docstrings = false",
+            );
+            assert!(
+                !diagnostics.iter().any(|diag| diag.code == "SKD605"),
+                "non-literal ctypes array lengths should not affect public type comparison: {diagnostics:#?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ctypes_array_storage_still_checks_element_type() {
+        let source = r#"
+from ctypes import Array, Structure, c_ubyte, c_uint16
+
+N = 8
+
+class C(Structure):
+    """Data.
+
+    Attributes
+    ----------
+    value : Array[c_ubyte]
+        Value.
+    """
+
+    _fields_ = [("value", c_uint16 * N)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(diagnostics.iter().any(|diag| diag.code == "SKD605"));
+    }
+
+    #[test]
+    fn typed_local_object_attribute_exception_matches_raise() {
+        let source = r#"
+class Capture:
+    def __init__(self) -> None:
+        self.error: OSError | None = None
+
+class Runner:
+    def run(self) -> None:
+        """Run.
+
+        Raises
+        ------
+        OSError
+            Stored error.
+        """
+        capture = Capture()
+        if capture.error is not None:
+            raise capture.error
+"#;
+        assert!(!codes(source).contains(&"SKD503".to_string()));
+    }
+
+    #[test]
+    fn ellipsis_stub_may_document_raises_without_skd502() {
+        let source = r#"
+def f() -> None:
+    """Do work.
+
+    Raises
+    ------
+    ValueError
+        Raised by the implementation.
+    """
+    ...
+"#;
+        assert!(!codes(source).contains(&"SKD502".to_string()));
+    }
+
+    #[test]
+    fn ctypes_static_fields_are_class_attributes() {
+        let source = r#"
+from ctypes import Structure, c_int
+
+class Packet(Structure):
+    """Packet.
+
+    Attributes
+    ----------
+    value : c_int
+        Value.
+    """
+
+    _fields_ = [("value", c_int)]
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        assert!(!diagnostics
+            .iter()
+            .any(|diag| matches!(diag.code.as_str(), "SKD602" | "SKD603" | "SKD605")));
     }
 
     #[test]
@@ -4844,7 +6032,82 @@ def f() -> Generator:
         assert!(codes.contains(&"SKD404".to_string()));
     }
     #[test]
-    fn skd002_uses_upstream_line_zero_for_syntax_errors() {
+    fn modern_pep701_fstring_does_not_emit_false_skd002_when_cpython_accepts_it() {
+        let source = r#"def f(descriptor):
+    return f"{int(descriptor["width"])}x{int(descriptor["height"])}"
+"#;
+        if cpython_syntax_status(source) != SyntaxOracleStatus::Valid {
+            return;
+        }
+        let diagnostics = run_pydoclint_rules(Path::new("example.py"), source, &strict_config());
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SKD002"));
+    }
+
+    #[test]
+    fn allow_init_docstring_is_enabled_by_default() {
+        assert!(PydoclintOptions::default().allow_init_docstring);
+    }
+
+    #[test]
+    fn allowed_init_docstring_preserves_upstream_duplicate_class_parse_error() {
+        let source = r#"
+class BadClassDoc:
+    """A test class.
+
+    Parameters
+    ----------
+        This has no parameter name.
+    """
+
+    def __init__(self, value) -> None:
+        """Initialize the class.
+
+        Parameters
+        ----------
+        value :
+            A value.
+        """
+        self.value = value
+"#;
+        let diagnostics = diagnostics_with_options(
+            source,
+            "style = 'numpy'\nskip-checking-short-docstrings = false",
+        );
+        let count = diagnostics
+            .iter()
+            .filter(|diag| diag.code == "SKD001")
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn quoted_forward_reference_argument_matches_unquoted_doc_type() {
+        let source = r#"
+def f(other: "Vector2 | NumberType") -> None:
+    """Summary.
+
+    Parameters
+    ----------
+    other : Vector2 | NumberType
+        Value.
+    """
+"#;
+        let codes = codes_with_options(
+            source,
+            "style = \"numpy\"\nskip-checking-short-docstrings = false",
+        );
+        assert!(!codes.contains(&"SKD105".to_string()));
+    }
+
+    #[test]
+    fn structural_section_fix_does_not_duplicate_existing_heading() {
+        let literal = "\"\"\"Summary.\n\n    Args:\n        value (int): Value.\n    \"\"\"";
+        let section = "Args:\n    value (int): Value for `value`";
+        assert!(section_heading_already_present(literal, section));
+    }
+
+    #[test]
+    fn skd002_uses_real_line_one_for_syntax_errors() {
         let diagnostics = run_pydoclint_rules(
             Path::new("example.py"),
             "def broken(:\n    pass\n",
@@ -4854,8 +6117,8 @@ def f() -> Generator:
             .iter()
             .find(|diagnostic| diagnostic.code == "SKD002")
             .expect("syntax error diagnostic");
-        assert_eq!(diagnostic.line, 0);
-        assert_eq!(diagnostic.end_line, 0);
+        assert_eq!(diagnostic.line, 1);
+        assert_eq!(diagnostic.end_line, 1);
     }
 
     #[test]
@@ -4882,7 +6145,7 @@ def f() -> Generator:
     }
 
     #[test]
-    fn skd002_reports_second_parse_error_on_line_zero_after_invisible_retry() {
+    fn skd002_reports_second_parse_error_on_line_one_after_invisible_retry() {
         let diagnostics = run_pydoclint_rules(
             Path::new("example.py"),
             "def broken(\u{200b}:\n    pass\n",
@@ -4892,8 +6155,8 @@ def f() -> Generator:
             .iter()
             .find(|diagnostic| diagnostic.code == "SKD002")
             .expect("second syntax error diagnostic");
-        assert_eq!(diagnostic.line, 0);
-        assert_eq!(diagnostic.end_line, 0);
+        assert_eq!(diagnostic.line, 1);
+        assert_eq!(diagnostic.end_line, 1);
     }
 
     #[test]
@@ -5499,7 +6762,7 @@ class C:
             .find(|diagnostic| diagnostic.code == "SKD603")
             .expect("SKD603");
         assert!(diagnostic.message.contains(
-            "Attributes in the class definition but not documented inline: [value: int]. (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html on how to correctly document class attributes.)"
+            "Attributes in the class definition but not documented inline: [value: int]. (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md on how to correctly document class attributes.)"
         ));
     }
 
@@ -5523,7 +6786,7 @@ class C:
             .find(|diagnostic| diagnostic.code == "SKD605")
             .expect("SKD605");
         assert!(diagnostic.message.contains(
-            "do not match: value  (Please read https://jsh9.github.io/pydoclint/checking_class_attributes.html"
+            "do not match: value  (Please read https://github.com/StableKite/SKLint/blob/main/docs/rules.ru.md"
         ));
     }
 

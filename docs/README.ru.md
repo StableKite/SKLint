@@ -28,8 +28,11 @@ CLI, Python wrapper и VSCode расширение не реализуют пр�
 | `SK8xx` | Strict-only performance simplifications |
 | `SK9xx` | Служебные предупреждения, например неактуальные suppressions |
 
-SKLint намеренно не должен заменять Ruff, Pyright, Pylint, wemake, flake8 или pydoclint.  
+SKLint намеренно не должен заменять Ruff, Pyright, Pylint, wemake или flake8. Встроенный Rust-native docstring semantic analyzer заменяет standalone pydoclint; legacy pydoclint-compatible names сохраняются только для migration compatibility.
+Для редких future-grammar gaps внешний CPython используется только как изолированный syntax oracle (`-I -S`) с жёстким timeout; конкретный interpreter можно закрепить через `SKLINT_PYTHON`.
 Если правило уже полностью покрыто внешним инструментом, оно не добавляется в SKLint. В SKLint остаются только проектные требования, дополнительные проверки и те случаи, которые существующие инструменты не закрывают полностью.
+
+> Linux release note: текущая glibc-сборка публикуется с PEP 600 tag `manylinux_2_39_x86_64`; она требует glibc >= 2.39. Для более старых дистрибутивов нужен отдельный older-baseline/musl build.
 
 # Общая информация о проекте
 

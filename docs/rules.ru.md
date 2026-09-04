@@ -37,7 +37,7 @@ CLI-команда `sklint format` и VSCode formatter используют од
 **Autofix:** нет.
 
 Запрещает вызовы `print(...)` вне блока `if __name__ == "__main__":`.
-Правило является проектным вариантом Ruff `T201`: вывод CLI допускается только в явной точке входа, а production/runtime-код должен использовать другой механизм вывода или логирования. Локально правило можно подавить как внутренним кодом `# noqa: SK201`, так и совместимым с Ruff кодом `# noqa: T201`. Alias `T201` относится только к `SK201` и не включает другие Ruff-коды в пространство правил SKLint.
+Правило является проектным аналогом Ruff `T201`: вывод CLI допускается только в явной точке входа, а production/runtime-код должен использовать другой механизм вывода или логирования. Подавление SKLint выполняется только внутренним селектором `# noqa: SK201`. Ruff-селектор `T201` остаётся собственностью Ruff и SKLint его не интерпретирует.
 
 ## SK211 — CommentCyrillicSentenceCapitalized
 
@@ -498,9 +498,9 @@ Autofix: удаляет строку `from __future__ import annotations`, ес�
 
 **Уровень:** strict-only.  
 
-Strict-only. Промежуточная переменная, которая используется ровно один раз во всём следующем логическом statement и может быть безопасно подставлена, должна быть свернута. При подсчёте учитываются многострочные выражения и дополнительные упоминания внутри f-string; при неоднозначности правило не предлагает автоматическое исправление.
+Strict-only. Промежуточная переменная, которая используется ровно один раз за оставшийся lexical lifetime в текущей функции (или модуле) и может быть безопасно подставлена в непосредственно следующий логический statement, должна быть свернута. При подсчёте учитываются многострочные выражения и дополнительные последующие упоминания; при неоднозначности правило консервативно не предлагает автоматическое исправление.
 
-Autofix: удаляет простое присваивание и подставляет выражение в полный следующий statement только после проверки единственного использования.
+Autofix: удаляет простое присваивание и подставляет выражение в полный следующий statement только после проверки, что имя больше нигде в оставшейся lexical scope не используется.
 
 ## SK802 — ReturnTernary
 
@@ -559,9 +559,9 @@ Autofix: безопасно удаляет только запрещённый f
 
 ## SKD002 — PythonSyntaxError
 
-**Уровень:** strict-only.  \n**Autofix:** нет.
+**Уровень:** normal.  \n**Autofix:** нет.
 
-Python source не удалось разобрать RustPython AST. Диагностика совместима с DOC002 и выдаётся на строке 0; для `invalid non-printable character` выполняется upstream-compatible retry после удаления известных invisible Unicode characters.
+Python source подтверждён как синтаксически невалидный. Диагностика совместима с DOC002 и выдаётся на первой строке файла; infrastructure failure внешнего syntax oracle не считается syntax error и вместо этого получает `SK903`. Для `invalid non-printable character` выполняется upstream-compatible retry после удаления известных invisible Unicode characters.
 
 ## SKD003 — DocstringStyleMismatch
 
@@ -729,13 +729,15 @@ Generator содержит `yield`, но секция `Yields` отсутств�
 
 **Уровень:** strict-only.  \n**Autofix:** нет.
 
-Докстринг объявляет исключения, которые функция не поднимает.
+Докстринг объявляет исключения, для которых SKLint не видит runtime exception path. Анализ учитывает явные `raise`/`assert` и распространённые implicit paths вроде division/modulo/indexing.
+
+Полный interprocedural exception-flow через произвольные callees пока не строится. Для wrapper-heavy проектов можно явно включить `[tool.sklint] allow_documented_propagated_exceptions = true`: тогда наличие call expression считается допустимым основанием для документированного propagated `Raises:` без ложного SKD502. По умолчанию опция выключена, чтобы сохранить строгую pydoclint-compatible семантику. Pure signature stubs с `...` не проверяются по direct-body `Raises` logic: документация исключений описывает отсутствующую реализацию, а не ellipsis-body.
 
 ## SKD503 — RaisedExceptionsMismatch
 
 **Уровень:** strict-only.  \n**Autofix:** нет.
 
-Набор документированных исключений не совпадает с реально поднимаемыми; дубликаты также считаются ошибкой.
+Набор документированных исключений не совпадает с реально поднимаемыми; дубликаты также считаются ошибкой. Для variable re-raise SKLint выводит тип из annotations параметров/локальных переменных, `self.attr` и атрибутов локально созданного typed object (`capture = Capture(); raise capture.error`), убирая `None` из Optional/union annotation.
 
 ## SKD504 — AssertRaisesSectionMissing
 
@@ -771,7 +773,7 @@ Generator содержит `yield`, но секция `Yields` отсутств�
 
 **Уровень:** strict-only.  \n**Autofix:** условный safe type-rewrite для Google/NumPy/Sphinx.
 
-Тип class attribute в докстринге отличается от аннотации/эффективного default-aware field type.
+Тип class attribute в докстринге отличается от аннотации/эффективного default-aware field type. Для `ctypes.Structure`/`Union` явная Python annotation имеет приоритет над raw `_fields_` storage declaration. `POINTER(T)` нормализуется для сравнения как `POINTER[T]`; неоднозначный storage-only ctypes mismatch не получает safe docstring rewrite.
 
 ## SKD606 — InlineClassAttributeDocForbidden
 
@@ -793,7 +795,22 @@ Inline-документация class attribute запрещена, когда c
 
 ## SK901 — MagicNumericConstant
 
+Числа внутри выражения, присваиваемого явно именованной константе (`UPPER_CASE` или аннотация `Final`), считаются самодокументируемым контекстом и не требуют дополнительного `SK901`-подавления.
+
 **Уровень:** strict-only.  \n**Autofix:** нет.
 
 Запрещает неочевидные числовые константы по объединённой семантике Ruff PLR2004 и WPS432. Разрешены self-documenting literal contexts/common values и специальные `sys.version*` comparisons; всё тело точного `if __name__ == "__main__":` исключено.
 
+
+
+## SK902 — PartialAstAnalysis
+
+**Уровень:** normal.  \n**Autofix:** нет.
+
+Python-файл синтаксически валиден для доступного изолированного CPython, но embedded parser SKLint не смог построить полный AST даже после compatibility rewrite. Такой файл не считается полностью проанализированным: diagnostic предотвращает silent false-green для AST-dependent rules. Compatibility layer покрывает используемые StableKite формы PEP 701/695/696, включая nested/multiline f-strings, generic classes/functions и default type parameters; SK902 остаётся safety net для будущих grammar gaps.
+
+## SK903 — SyntaxOracleUnavailable
+
+**Уровень:** normal.  \n**Autofix:** нет.
+
+Embedded parser не смог разобрать файл, а внешний изолированный syntax oracle (`SKLINT_PYTHON`, `python3`, `python` или `py -3`) отсутствует, завершился инфраструктурной ошибкой либо превысил timeout. Это состояние не трактуется как syntax error исходника: `SKD002` выдаётся только после подтверждённого syntax rejection.

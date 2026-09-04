@@ -30,6 +30,17 @@ enum ExprContext {
     DirectLiteralSafe,
     /// A direct comparison operand. Ruff comparison logic owns the literal.
     ComparisonOperand,
+    /// RHS of an explicitly named constant. Literal-building operations are
+    /// self-documenting, but comparison operands inside the RHS remain magic.
+    NamedConstantValue,
+}
+
+fn nested_expr_context(parent: ExprContext, default: ExprContext) -> ExprContext {
+    if parent == ExprContext::NamedConstantValue {
+        ExprContext::NamedConstantValue
+    } else {
+        default
+    }
 }
 
 struct Visitor<'a> {
@@ -188,7 +199,12 @@ impl Visitor<'_> {
                     for target in &node.targets {
                         self.visit_expr(target, scope, ExprContext::Normal);
                     }
-                    self.visit_expr(&node.value, scope, ExprContext::DirectLiteralSafe);
+                    let context = if node.targets.iter().all(is_named_constant_target) {
+                        ExprContext::NamedConstantValue
+                    } else {
+                        ExprContext::DirectLiteralSafe
+                    };
+                    self.visit_expr(&node.value, scope, context);
                 }
                 Stmt::TypeAlias(node) => {
                     self.visit_expr(&node.name, scope, ExprContext::Normal);
@@ -202,7 +218,14 @@ impl Visitor<'_> {
                     self.visit_expr(&node.target, scope, ExprContext::Normal);
                     self.visit_annotation(&node.annotation, scope);
                     if let Some(value) = &node.value {
-                        self.visit_expr(value, scope, ExprContext::DirectLiteralSafe);
+                        let context = if is_named_constant_target(&node.target)
+                            || is_final_annotation(&node.annotation)
+                        {
+                            ExprContext::NamedConstantValue
+                        } else {
+                            ExprContext::DirectLiteralSafe
+                        };
+                        self.visit_expr(value, scope, context);
                     }
                 }
                 Stmt::For(node) => {
@@ -319,7 +342,9 @@ impl Visitor<'_> {
     fn visit_expr(&mut self, expr: &Expr, scope: &Scope, context: ExprContext) {
         if let Some(text) = numeric_literal_text(self.source, expr) {
             match context {
-                ExprContext::DirectLiteralSafe | ExprContext::ComparisonOperand => return,
+                ExprContext::DirectLiteralSafe
+                | ExprContext::ComparisonOperand
+                | ExprContext::NamedConstantValue => return,
                 ExprContext::Normal => {
                     if !wps_number_allowed(&text) {
                         self.report(expr, &text);
@@ -332,112 +357,248 @@ impl Visitor<'_> {
         match expr {
             Expr::BoolOp(node) => {
                 for value in &node.values {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
             Expr::NamedExpr(node) => {
-                self.visit_expr(&node.target, scope, ExprContext::Normal);
-                self.visit_expr(&node.value, scope, ExprContext::DirectLiteralSafe);
+                self.visit_expr(
+                    &node.target,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
+                self.visit_expr(
+                    &node.value,
+                    scope,
+                    nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                );
             }
             Expr::BinOp(node) => {
-                self.visit_expr(&node.left, scope, ExprContext::Normal);
-                self.visit_expr(&node.right, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.left,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
+                self.visit_expr(
+                    &node.right,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
             }
-            Expr::UnaryOp(node) => self.visit_expr(&node.operand, scope, ExprContext::Normal),
+            Expr::UnaryOp(node) => self.visit_expr(
+                &node.operand,
+                scope,
+                nested_expr_context(context, ExprContext::Normal),
+            ),
             Expr::Lambda(node) => {
                 for arg in &node.args.posonlyargs {
                     if let Some(default) = &arg.default {
-                        self.visit_expr(default, scope, ExprContext::DirectLiteralSafe);
+                        self.visit_expr(
+                            default,
+                            scope,
+                            nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                        );
                     }
                 }
                 for arg in &node.args.args {
                     if let Some(default) = &arg.default {
-                        self.visit_expr(default, scope, ExprContext::DirectLiteralSafe);
+                        self.visit_expr(
+                            default,
+                            scope,
+                            nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                        );
                     }
                 }
                 for arg in &node.args.kwonlyargs {
                     if let Some(default) = &arg.default {
-                        self.visit_expr(default, scope, ExprContext::DirectLiteralSafe);
+                        self.visit_expr(
+                            default,
+                            scope,
+                            nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                        );
                     }
                 }
-                self.visit_expr(&node.body, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.body,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
             }
             Expr::IfExp(node) => {
-                self.visit_expr(&node.test, scope, ExprContext::Normal);
-                self.visit_expr(&node.body, scope, ExprContext::Normal);
-                self.visit_expr(&node.orelse, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.test,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
+                self.visit_expr(
+                    &node.body,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
+                self.visit_expr(
+                    &node.orelse,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
             }
             Expr::Dict(node) => {
                 for key in node.keys.iter().flatten() {
-                    self.visit_expr(key, scope, ExprContext::DirectLiteralSafe);
+                    self.visit_expr(
+                        key,
+                        scope,
+                        nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                    );
                 }
                 for value in &node.values {
-                    self.visit_expr(value, scope, ExprContext::DirectLiteralSafe);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                    );
                 }
             }
             Expr::Set(node) => {
                 for value in &node.elts {
-                    self.visit_expr(value, scope, ExprContext::DirectLiteralSafe);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                    );
                 }
             }
             Expr::List(node) => {
                 for value in &node.elts {
-                    self.visit_expr(value, scope, ExprContext::DirectLiteralSafe);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                    );
                 }
             }
             Expr::Tuple(node) => {
                 for value in &node.elts {
-                    self.visit_expr(value, scope, ExprContext::DirectLiteralSafe);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::DirectLiteralSafe),
+                    );
                 }
             }
             Expr::ListComp(node) => {
-                self.visit_expr(&node.elt, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.elt,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 self.visit_comprehensions(&node.generators, scope);
             }
             Expr::SetComp(node) => {
-                self.visit_expr(&node.elt, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.elt,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 self.visit_comprehensions(&node.generators, scope);
             }
             Expr::DictComp(node) => {
-                self.visit_expr(&node.key, scope, ExprContext::Normal);
-                self.visit_expr(&node.value, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.key,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
+                self.visit_expr(
+                    &node.value,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 self.visit_comprehensions(&node.generators, scope);
             }
             Expr::GeneratorExp(node) => {
-                self.visit_expr(&node.elt, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.elt,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 self.visit_comprehensions(&node.generators, scope);
             }
-            Expr::Await(node) => self.visit_expr(&node.value, scope, ExprContext::Normal),
+            Expr::Await(node) => self.visit_expr(
+                &node.value,
+                scope,
+                nested_expr_context(context, ExprContext::Normal),
+            ),
             Expr::Yield(node) => {
                 if let Some(value) = &node.value {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
-            Expr::YieldFrom(node) => self.visit_expr(&node.value, scope, ExprContext::Normal),
+            Expr::YieldFrom(node) => self.visit_expr(
+                &node.value,
+                scope,
+                nested_expr_context(context, ExprContext::Normal),
+            ),
             Expr::Compare(node) => self.visit_comparison(&node.left, &node.comparators, scope),
             Expr::Call(node) => {
-                self.visit_expr(&node.func, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.func,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 for arg in &node.args {
-                    self.visit_expr(arg, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        arg,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
                 for keyword in &node.keywords {
-                    self.visit_expr(&keyword.value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        &keyword.value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
             Expr::FormattedValue(node) => {
-                self.visit_expr(&node.value, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.value,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 if let Some(spec) = &node.format_spec {
-                    self.visit_expr(spec, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        spec,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
             Expr::JoinedStr(node) => {
                 for value in &node.values {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
-            Expr::Attribute(node) => self.visit_expr(&node.value, scope, ExprContext::Normal),
+            Expr::Attribute(node) => self.visit_expr(
+                &node.value,
+                scope,
+                nested_expr_context(context, ExprContext::Normal),
+            ),
             Expr::Subscript(node) => {
-                self.visit_expr(&node.value, scope, ExprContext::Normal);
+                self.visit_expr(
+                    &node.value,
+                    scope,
+                    nested_expr_context(context, ExprContext::Normal),
+                );
                 let slice_context = if is_literal_annotation(expr) {
                     ExprContext::DirectLiteralSafe
                 } else {
@@ -445,16 +606,32 @@ impl Visitor<'_> {
                 };
                 self.visit_expr(&node.slice, scope, slice_context);
             }
-            Expr::Starred(node) => self.visit_expr(&node.value, scope, ExprContext::Normal),
+            Expr::Starred(node) => self.visit_expr(
+                &node.value,
+                scope,
+                nested_expr_context(context, ExprContext::Normal),
+            ),
             Expr::Slice(node) => {
                 if let Some(value) = &node.lower {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
                 if let Some(value) = &node.upper {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
                 if let Some(value) = &node.step {
-                    self.visit_expr(value, scope, ExprContext::Normal);
+                    self.visit_expr(
+                        value,
+                        scope,
+                        nested_expr_context(context, ExprContext::Normal),
+                    );
                 }
             }
             Expr::Constant(_) | Expr::Name(_) => {}
@@ -723,6 +900,19 @@ fn unwrap_subscript(mut expr: &Expr) -> &Expr {
     expr
 }
 
+fn is_named_constant_target(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(name) if {
+        let value = name.id.as_str();
+        !value.is_empty()
+            && value.chars().any(|ch| ch.is_ascii_alphabetic())
+            && value.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    })
+}
+
+fn is_final_annotation(expr: &Expr) -> bool {
+    qualified_name(expr).is_some_and(|name| name == "Final" || name.ends_with(".Final"))
+}
+
 fn scope_for_body(parent: &Scope, body: &[Stmt], initial_bound: &[String]) -> Scope {
     let mut scope = parent.clone();
     let mut shadowed = initial_bound.iter().cloned().collect::<HashSet<_>>();
@@ -893,6 +1083,31 @@ def f(value=999):
     typed: Literal[999]
 "#;
         assert!(diagnostics(source).is_empty());
+    }
+
+    #[test]
+    fn named_constant_expression_is_self_documenting() {
+        let found = diagnostics("TCGETS2: Final = getattr(termios, \"TCGETS2\", 0x802C542A)\n");
+        assert!(found.is_empty());
+        let found = diagnostics("MASK = 1 << 31\n");
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn named_constant_still_checks_comparison_operands() {
+        let found = diagnostics("SPECIAL = get_value() == 999\n");
+        assert_eq!(found.iter().filter(|diag| diag.code == "SK901").count(), 1);
+
+        let found = diagnostics("IS_SPECIAL: Final = get_value() == 998\n");
+        assert_eq!(found.iter().filter(|diag| diag.code == "SK901").count(), 1);
+    }
+
+    #[test]
+    fn named_constant_literal_building_remains_allowed() {
+        assert!(diagnostics("MASK = 1 << 31\n").is_empty());
+        assert!(
+            diagnostics("TIOCMGET: Final = getattr(termios, \"TIOCMGET\", 0x5415)\n").is_empty()
+        );
     }
 
     #[test]

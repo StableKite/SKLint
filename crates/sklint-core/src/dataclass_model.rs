@@ -7,9 +7,11 @@
 
 use crate::python_ast::{qualified_name, string_constant, PythonAst};
 use rustpython_parser::ast::{Expr, Stmt};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataclassField {
@@ -29,6 +31,7 @@ pub struct DataclassClass {
     pub processes_own_fields: bool,
     pub propagates_transform: bool,
     pub direct_fields: Vec<DataclassField>,
+    pub declared_attrs: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,7 +45,6 @@ pub struct DataclassModel {
 #[derive(Debug, Clone, Default)]
 struct Imports {
     aliases: HashMap<String, String>,
-    imported_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ struct RawClass {
     decorators: Vec<String>,
     metaclass: Option<String>,
     direct_fields: Vec<DataclassField>,
+    declared_attrs: HashSet<String>,
     is_transform_provider: bool,
 }
 
@@ -79,6 +82,28 @@ impl DataclassModel {
     /// third-party modules that are not present under the project root are not
     /// imported/executed; their names remain symbolic.
     pub fn from_path(path: &Path, source: &str, ast: &PythonAst) -> Self {
+        static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64), DataclassModel>>> = OnceLock::new();
+
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        let source_hash = hasher.finish();
+        let cache_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let cache_key = (cache_path, source_hash);
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache.lock() {
+            if let Some(model) = guard.get(&cache_key) {
+                return model.clone();
+            }
+        }
+
+        let model = Self::from_path_uncached(path, source, ast);
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(cache_key, model.clone());
+        }
+        model
+    }
+
+    fn from_path_uncached(path: &Path, source: &str, ast: &PythonAst) -> Self {
         let Some(root) = project_root(path) else {
             return Self::from_ast(source, ast);
         };
@@ -89,34 +114,35 @@ impl DataclassModel {
         let mut modules = Vec::new();
         let mut queued = HashSet::new();
         let mut queue = VecDeque::new();
-        for module in &current.imports.imported_modules {
-            if queued.insert(module.clone()) {
-                queue.push_back(module.clone());
-            }
-        }
+        let mut requested = HashMap::<String, HashSet<String>>::new();
+        queue_semantic_references(&root, &current, &mut queued, &mut queue, &mut requested);
         modules.push(current);
 
         while let Some(module_name) = queue.pop_front() {
-            let Some(module_path) = path_for_module(&root, &module_name) else {
+            let Some(raw) = load_raw_module_cached(&root, &module_name) else {
                 continue;
             };
-            let Ok(module_source) = fs::read_to_string(&module_path) else {
-                continue;
-            };
-            let Ok(module_ast) =
-                PythonAst::parse(&module_source, &module_path.display().to_string())
-            else {
-                continue;
-            };
-            let is_package = module_path
-                .file_name()
-                .is_some_and(|name| name == "__init__.py");
-            let raw = raw_module_from_ast(&module_source, &module_ast, &module_name, is_package);
-            for imported in &raw.imports.imported_modules {
-                if queued.insert(imported.clone()) {
-                    queue.push_back(imported.clone());
+
+            // A package re-export module can import hundreds of unrelated
+            // modules. Follow only aliases for symbols that were actually
+            // requested by a base/decorator/metaclass reference.
+            if raw.classes.is_empty() {
+                let symbols = requested.get(&module_name).cloned().unwrap_or_default();
+                for symbol in &symbols {
+                    let local = symbol.split('.').next().unwrap_or(symbol);
+                    if let Some(target) = raw.imports.aliases.get(local) {
+                        queue_symbol_reference(
+                            &root,
+                            target,
+                            &mut queued,
+                            &mut queue,
+                            &mut requested,
+                        );
+                    }
                 }
             }
+
+            queue_semantic_references(&root, &raw, &mut queued, &mut queue, &mut requested);
             modules.push(raw);
         }
 
@@ -230,12 +256,205 @@ impl DataclassModel {
         out
     }
 
+    pub fn inherited_annotated_fields(&self, class_name: &str) -> Vec<DataclassField> {
+        let qualified = self.qualify_current_class(class_name);
+        let mro = c3_mro(&qualified, &self.all_classes, &mut HashSet::new());
+        let mut out = Vec::<DataclassField>::new();
+        for name in mro.into_iter().skip(1).rev() {
+            let Some(class) = self.all_classes.get(&name) else {
+                continue;
+            };
+            for field in &class.direct_fields {
+                if let Some(existing) = out.iter_mut().find(|item| item.name == field.name) {
+                    *existing = field.clone();
+                } else {
+                    out.push(field.clone());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn effective_declared_attrs(&self, class_name: &str) -> HashSet<String> {
+        let qualified = self.qualify_current_class(class_name);
+        let mro = c3_mro(&qualified, &self.all_classes, &mut HashSet::new());
+        let mut out = HashSet::new();
+        for name in mro {
+            if let Some(class) = self.all_classes.get(&name) {
+                out.extend(class.declared_attrs.iter().cloned());
+            }
+        }
+        out
+    }
+
+    pub fn enum_value_type(&self, class_name: &str) -> Option<&'static str> {
+        let qualified = self.qualify_current_class(class_name);
+        enum_value_type_for(&qualified, &self.all_classes, &mut HashSet::new())
+    }
+
+    /// Whether this class inherits from one of the canonical ctypes record
+    /// bases, directly or through a project-local intermediate class.
+    pub fn is_ctypes_record(&self, class_name: &str) -> bool {
+        let qualified = self.qualify_current_class(class_name);
+        inherits_external_base(
+            &qualified,
+            &self.all_classes,
+            &["ctypes.Structure", "ctypes.Union"],
+            &mut HashSet::new(),
+        )
+    }
+
     fn qualify_current_class(&self, name: &str) -> String {
         if name.contains('.') || self.current_module.is_empty() {
             name.to_string()
         } else {
             format!("{}.{}", self.current_module, name)
         }
+    }
+}
+
+fn inherits_external_base(
+    class_name: &str,
+    classes: &HashMap<String, DataclassClass>,
+    wanted: &[&str],
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if !visiting.insert(class_name.to_string()) {
+        return false;
+    }
+    let result = classes.get(class_name).is_some_and(|class| {
+        class.bases.iter().any(|base| {
+            wanted.iter().any(|wanted| base == wanted)
+                || inherits_external_base(base, classes, wanted, visiting)
+        })
+    });
+    visiting.remove(class_name);
+    result
+}
+
+fn collect_declared_attrs(body: &[Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in body {
+        match stmt {
+            Stmt::AnnAssign(node) => {
+                if let Expr::Name(name) = node.target.as_ref() {
+                    out.insert(name.id.to_string());
+                }
+            }
+            Stmt::Assign(node) => {
+                for target in &node.targets {
+                    if let Expr::Name(name) = target {
+                        out.insert(name.id.to_string());
+                    }
+                }
+            }
+            Stmt::If(node) if is_type_checking_guard(&node.test) => {
+                // Type-only class annotations are deliberate declarations for
+                // static analysis even though they do not execute at runtime.
+                out.extend(collect_declared_attrs(&node.body));
+                out.extend(collect_declared_attrs(&node.orelse));
+            }
+            Stmt::FunctionDef(node)
+                if matches!(
+                    node.name.as_str(),
+                    "__init__" | "__post_init__" | "__setstate__"
+                ) =>
+            {
+                collect_self_assignments(&node.body, &mut out);
+            }
+            Stmt::AsyncFunctionDef(node)
+                if matches!(
+                    node.name.as_str(),
+                    "__init__" | "__post_init__" | "__setstate__"
+                ) =>
+            {
+                collect_self_assignments(&node.body, &mut out);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn is_type_checking_guard(expr: &Expr) -> bool {
+    qualified_name(expr)
+        .is_some_and(|name| name == "TYPE_CHECKING" || name.ends_with(".TYPE_CHECKING"))
+}
+
+fn collect_self_assignments(body: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(node) => {
+                for target in &node.targets {
+                    collect_self_target(target, out);
+                }
+            }
+            Stmt::AnnAssign(node) => collect_self_target(node.target.as_ref(), out),
+            Stmt::AugAssign(node) => collect_self_target(node.target.as_ref(), out),
+            Stmt::If(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+            }
+            Stmt::For(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+            }
+            Stmt::AsyncFor(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+            }
+            Stmt::While(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+            }
+            Stmt::With(node) => collect_self_assignments(&node.body, out),
+            Stmt::AsyncWith(node) => collect_self_assignments(&node.body, out),
+            Stmt::Try(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+                collect_self_assignments(&node.finalbody, out);
+                for handler in &node.handlers {
+                    let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_self_assignments(&handler.body, out);
+                }
+            }
+            Stmt::TryStar(node) => {
+                collect_self_assignments(&node.body, out);
+                collect_self_assignments(&node.orelse, out);
+                collect_self_assignments(&node.finalbody, out);
+                for handler in &node.handlers {
+                    let rustpython_parser::ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_self_assignments(&handler.body, out);
+                }
+            }
+            Stmt::Match(node) => {
+                for case in &node.cases {
+                    collect_self_assignments(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_self_target(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Attribute(node) => {
+            if matches!(node.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self") {
+                out.insert(node.attr.to_string());
+            }
+        }
+        Expr::Tuple(node) => {
+            for element in &node.elts {
+                collect_self_target(element, out);
+            }
+        }
+        Expr::List(node) => {
+            for element in &node.elts {
+                collect_self_target(element, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -275,7 +494,7 @@ fn raw_module_from_ast(
         let bases = class
             .bases
             .iter()
-            .filter_map(qualified_name)
+            .filter_map(class_base_name)
             .map(|name| imports.resolve_symbol(&name, module_name))
             .collect::<Vec<_>>();
         let decorators = class
@@ -296,6 +515,7 @@ fn raw_module_from_ast(
             .and_then(|keyword| qualified_name(&keyword.value))
             .map(|name| imports.resolve_symbol(&name, module_name));
         let direct_fields = collect_direct_fields(source, ast, &class.body, &imports);
+        let declared_attrs = collect_declared_attrs(&class.body);
         let provider_name = qualify_local_symbol(module_name, &name);
 
         classes.push(RawClass {
@@ -306,6 +526,7 @@ fn raw_module_from_ast(
             decorators,
             metaclass,
             direct_fields,
+            declared_attrs,
             is_transform_provider: transform_providers.contains(&provider_name),
         });
     }
@@ -321,7 +542,6 @@ fn raw_module_from_ast(
 impl Imports {
     fn from_suite(suite: &[Stmt], module_name: &str, is_package: bool) -> Self {
         let mut aliases = HashMap::new();
-        let mut imported_modules = Vec::new();
         for stmt in suite {
             match stmt {
                 Stmt::Import(import) => {
@@ -344,7 +564,6 @@ impl Imports {
                             local.clone()
                         };
                         aliases.insert(local, bound_target);
-                        push_unique(&mut imported_modules, target);
                     }
                 }
                 Stmt::ImportFrom(import) => {
@@ -359,9 +578,6 @@ impl Imports {
                         level,
                         import.module.as_ref().map(ToString::to_string).as_deref(),
                     );
-                    if !module.is_empty() {
-                        push_unique(&mut imported_modules, module.clone());
-                    }
                     for item in &import.names {
                         if item.name.as_str() == "*" {
                             continue;
@@ -381,17 +597,13 @@ impl Imports {
                         // Also queue the candidate for ordinary `from pkg import
                         // schema` forms; nonexistent attribute-as-module paths are
                         // ignored safely by the project loader.
-                        push_unique(&mut imported_modules, target.clone());
                         aliases.insert(local, target);
                     }
                 }
                 _ => {}
             }
         }
-        Self {
-            aliases,
-            imported_modules,
-        }
+        Self { aliases }
     }
 
     fn resolve_symbol(&self, name: &str, module_name: &str) -> String {
@@ -407,6 +619,81 @@ impl Imports {
             return name.to_string();
         }
         qualify_local_symbol(module_name, name)
+    }
+}
+
+fn load_raw_module_cached(root: &Path, module_name: &str) -> Option<RawModule> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64), RawModule>>> = OnceLock::new();
+
+    let module_path = path_for_module(root, module_name)?;
+    let module_source = fs::read_to_string(&module_path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    module_source.hash(&mut hasher);
+    let source_hash = hasher.finish();
+    let canonical = fs::canonicalize(&module_path).unwrap_or(module_path.clone());
+    let key = (canonical, source_hash);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(module) = guard.get(&key) {
+            return Some(module.clone());
+        }
+    }
+
+    let module_ast = PythonAst::parse(&module_source, &module_path.display().to_string()).ok()?;
+    let is_package = module_path
+        .file_name()
+        .is_some_and(|name| name == "__init__.py");
+    let raw = raw_module_from_ast(&module_source, &module_ast, module_name, is_package);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, raw.clone());
+    }
+    Some(raw)
+}
+
+fn queue_semantic_references(
+    root: &Path,
+    module: &RawModule,
+    queued: &mut HashSet<String>,
+    queue: &mut VecDeque<String>,
+    requested: &mut HashMap<String, HashSet<String>>,
+) {
+    for class in &module.classes {
+        for symbol in &class.bases {
+            queue_symbol_reference(root, symbol, queued, queue, requested);
+        }
+        for symbol in &class.decorators {
+            queue_symbol_reference(root, symbol, queued, queue, requested);
+        }
+        if let Some(symbol) = &class.metaclass {
+            queue_symbol_reference(root, symbol, queued, queue, requested);
+        }
+    }
+}
+
+fn queue_symbol_reference(
+    root: &Path,
+    symbol: &str,
+    queued: &mut HashSet<String>,
+    queue: &mut VecDeque<String>,
+    requested: &mut HashMap<String, HashSet<String>>,
+) {
+    let parts = symbol.split('.').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return;
+    }
+    for split in (1..parts.len()).rev() {
+        let candidate = parts[..split].join(".");
+        if path_for_module(root, &candidate).is_none() {
+            continue;
+        }
+        let tail = parts[split..].join(".");
+        if !tail.is_empty() {
+            requested.entry(candidate.clone()).or_default().insert(tail);
+        }
+        if queued.insert(candidate.clone()) {
+            queue.push_back(candidate);
+        }
+        break;
     }
 }
 
@@ -474,6 +761,7 @@ fn compute_class(
             processes_own_fields: false,
             propagates_transform: raw.is_transform_provider,
             direct_fields: raw.direct_fields.clone(),
+            declared_attrs: raw.declared_attrs.clone(),
         };
     }
 
@@ -540,10 +828,18 @@ fn compute_class(
         processes_own_fields,
         propagates_transform,
         direct_fields: raw.direct_fields.clone(),
+        declared_attrs: raw.declared_attrs.clone(),
     };
     visiting.remove(&raw.qualified_name);
     computed.insert(raw.qualified_name.clone(), result.clone());
     result
+}
+
+fn class_base_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Subscript(node) => qualified_name(&node.value),
+        _ => qualified_name(expr),
+    }
 }
 
 fn canonical_ast_text(expr: &Expr) -> String {
@@ -690,6 +986,36 @@ fn module_part(symbol: &str) -> &str {
         .unwrap_or("")
 }
 
+fn enum_value_type_for(
+    class_name: &str,
+    by_name: &HashMap<String, DataclassClass>,
+    visiting: &mut HashSet<String>,
+) -> Option<&'static str> {
+    if !visiting.insert(class_name.to_string()) {
+        return None;
+    }
+    let class = by_name.get(class_name)?;
+    for base in &class.bases {
+        let leaf = base.rsplit('.').next().unwrap_or(base);
+        if leaf == "IntEnum" {
+            visiting.remove(class_name);
+            return Some("int");
+        }
+        if leaf == "StrEnum" {
+            visiting.remove(class_name);
+            return Some("str");
+        }
+        if by_name.contains_key(base) {
+            if let Some(value_type) = enum_value_type_for(base, by_name, visiting) {
+                visiting.remove(class_name);
+                return Some(value_type);
+            }
+        }
+    }
+    visiting.remove(class_name);
+    None
+}
+
 fn c3_mro(
     class_name: &str,
     by_name: &HashMap<String, DataclassClass>,
@@ -818,12 +1144,6 @@ fn path_for_module(root: &Path, module: &str) -> Option<PathBuf> {
     }
     let package = root.join(relative).join("__init__.py");
     package.is_file().then_some(package)
-}
-
-fn push_unique(items: &mut Vec<String>, item: String) {
-    if !items.iter().any(|existing| existing == &item) {
-        items.push(item);
-    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1410,39 @@ class Item:
         assert_eq!(model.effective_fields("Item")[0].name, "value");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn type_checking_annotations_count_as_declared_attributes() {
+        let source = r#"from typing import TYPE_CHECKING
+
+class Item:
+    if TYPE_CHECKING:
+        flag: bool
+
+    def run(self) -> None:
+        self.flag = True
+"#;
+        let model = model(source);
+        assert!(model.effective_declared_attrs("Item").contains("flag"));
+    }
+
+    #[test]
+    fn enum_value_type_follows_indirect_intenum_and_strenum_ancestry() {
+        let source = r#"from enum import IntEnum, StrEnum
+
+class CustomInt(IntEnum):
+    pass
+
+class Mode(CustomInt):
+    A = 1
+
+class TextMode(StrEnum):
+    A = "a"
+"#;
+        let model = model(source);
+        assert_eq!(model.enum_value_type("Mode"), Some("int"));
+        assert_eq!(model.enum_value_type("TextMode"), Some("str"));
     }
 
     #[test]

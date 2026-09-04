@@ -1,9 +1,10 @@
 use crate::config::EffectiveConfig;
 use crate::dataclass_model::{DataclassField, DataclassModel};
 use crate::diagnostic::{Diagnostic, Fix, Span};
+use crate::pydoclint::PydoclintOptions;
 use crate::pydoclint_doc::DocStyle;
 use crate::python_ast::PythonAst;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const ALLOWED_SECTIONS: &[&str] = &["Args", "Attributes", "Returns", "Yields", "Raises"];
@@ -69,6 +70,14 @@ pub fn run_docstring_rules(path: &Path, source: &str, config: &EffectiveConfig) 
     } else {
         None
     };
+    let document_private_dataclass_fields = PydoclintOptions::load_for_path_with_config_context(
+        path,
+        config.formatter_docstring_style,
+        config.pydoclint_inferred_config_context.as_deref(),
+        config.pydoclint_config_path.as_deref(),
+        &config.pydoclint_overrides,
+    )
+    .should_document_private_class_attributes;
     let mut diagnostics = Vec::new();
 
     for doc in &docs {
@@ -77,7 +86,14 @@ pub fn run_docstring_rules(path: &Path, source: &str, config: &EffectiveConfig) 
 
     run_constant_rules(&display_path, &lines, &docs, config, &mut diagnostics);
     if let Some(model) = dataclass_model.as_ref() {
-        run_dataclass_rules(&display_path, model, &docs, config, &mut diagnostics);
+        run_dataclass_rules(
+            &display_path,
+            model,
+            &docs,
+            config,
+            document_private_dataclass_fields,
+            &mut diagnostics,
+        );
     }
     diagnostics
 }
@@ -1010,6 +1026,7 @@ fn run_dataclass_rules(
     model: &DataclassModel,
     docs: &[Docstring],
     config: &EffectiveConfig,
+    document_private_fields: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !config.is_enabled("SK619") && !config.is_enabled("SK620") {
@@ -1023,11 +1040,32 @@ fn run_dataclass_rules(
         else {
             continue;
         };
-        let fields = model.effective_fields(&class.name);
+        // Inherited dataclass fields inherit their documentation from the
+        // base class. A subclass only has to document fields it declares
+        // itself; however, if it voluntarily documents an inherited field,
+        // preserve and validate that entry instead of dropping it from a fix.
+        let attrs = attribute_docs(doc);
+        let documented_names = attrs
+            .iter()
+            .map(|attr| attr.name.as_str())
+            .collect::<HashSet<_>>();
+        let direct_names = class
+            .direct_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<HashSet<_>>();
+        let fields = model
+            .effective_fields(&class.name)
+            .into_iter()
+            .filter(|field| document_private_fields || !field.name.starts_with('_'))
+            .filter(|field| {
+                direct_names.contains(field.name.as_str())
+                    || documented_names.contains(field.name.as_str())
+            })
+            .collect::<Vec<_>>();
         if fields.is_empty() {
             continue;
         }
-        let attrs = attribute_docs(doc);
         let attrs_by_name: HashMap<String, AttributeDoc> = attrs
             .iter()
             .cloned()
@@ -1146,7 +1184,9 @@ fn dataclass_attributes_fix(
             .unwrap_or_else(|| "TODO: описание".to_string());
         replacement_lines.push(format!(
             "{item_indent}{} ({}): {}",
-            field.name, field.ty, description
+            field.name,
+            display_dataclass_type(&field.ty),
+            description
         ));
     }
     let replacement = replacement_lines.join("\n");
@@ -1497,10 +1537,24 @@ fn sections(doc: &Docstring) -> Vec<Section> {
 
     let mut sections = Vec::new();
     for (pos, (start_idx, name)) in starts.iter().enumerate() {
-        let end_idx = starts
+        let mut end_idx = starts
             .get(pos + 1)
             .map(|(next, _)| next.saturating_sub(1))
             .unwrap_or_else(|| doc.content.len().saturating_sub(1));
+
+        // The final DocLine of a multiline docstring represents the text
+        // before the closing quote. For the common indented `    """`
+        // form that line is whitespace-only and is not part of the final
+        // semantic section. Including it in a section rewrite would make a
+        // safe fix consume the indentation that belongs to the closing
+        // delimiter, which can turn otherwise valid Python into invalid
+        // source on a later formatting round.
+        if pos + 1 == starts.len() {
+            while end_idx > *start_idx && doc.content[end_idx].text.trim().is_empty() {
+                end_idx -= 1;
+            }
+        }
+
         sections.push(Section {
             name: name.clone(),
             heading_line: doc.content[*start_idx].line,
@@ -2027,11 +2081,28 @@ fn first_non_ws_col(text: &str) -> usize {
 }
 
 fn normalize_type(text: &str) -> String {
+    let text = strip_outer_forward_reference_quotes(text);
     text.chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .replace("typing.", "")
         .replace('"', "'")
+}
+
+fn strip_outer_forward_reference_quotes(text: &str) -> &str {
+    let text = text.trim();
+    if text.len() >= 2
+        && ((text.starts_with('\'') && text.ends_with('\''))
+            || (text.starts_with('"') && text.ends_with('"')))
+    {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
+}
+
+fn display_dataclass_type(text: &str) -> &str {
+    strip_outer_forward_reference_quotes(text)
 }
 
 fn doc_diag(
@@ -2292,9 +2363,44 @@ print(_LAZY_IMPORTS)
     }
 
     #[test]
-    fn catches_dataclass_inherited_attribute() {
+    fn sk619_respects_private_class_attribute_policy() {
+        let source = r#"from dataclasses import dataclass
+
+@dataclass
+class CameraCalibration:
+    """Calibration.
+
+    Attributes:
+        width (int): Width.
+    """
+
+    width: int
+    _rectified_matrices: tuple[int, int]
+"#;
+        assert!(!codes(source).contains(&"SK619".to_string()));
+    }
+
+    #[test]
+    fn sk620_normalizes_quoted_forward_reference_and_does_not_quote_fix() {
+        let source = r#"from dataclasses import dataclass
+
+@dataclass
+class Node:
+    """Node.
+
+    Attributes:
+        child (Node | None): Child.
+    """
+    child: "Node | None" = None
+"#;
+        let diagnostics = codes(source);
+        assert!(!diagnostics.contains(&"SK620".to_string()));
+    }
+
+    #[test]
+    fn inherited_dataclass_attribute_documentation_is_not_required_in_subclass() {
         let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    \"\"\"\n    Описание\n\n    Attributes:\n        x (int): значение\n    \"\"\"\n    x: int\n\n@dataclass\nclass Child(Base):\n    \"\"\"\n    Описание\n\n    Attributes:\n        y (str): значение\n    \"\"\"\n    y: str\n";
-        assert!(codes(source).contains(&"SK619".to_string()));
+        assert!(!codes(source).contains(&"SK619".to_string()));
     }
 
     #[test]

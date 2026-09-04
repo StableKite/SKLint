@@ -338,8 +338,6 @@ fn selector_specificity(selector: &str) -> usize {
     let selector = selector.trim().to_ascii_uppercase();
     if selector == "ALL" {
         0
-    } else if selector == "T201" {
-        6
     } else if let Some(suffix) = selector.strip_prefix("DOC") {
         3 + suffix.len()
     } else {
@@ -440,15 +438,14 @@ fn parse_noqa(comment: &str) -> Option<Vec<String>> {
     let remainder = noqa_remainder(text)?;
     let Some(rest) = remainder.trim_start().strip_prefix(':') else {
         // Deliberately do not treat bare `# noqa` as an SKLint suppression:
-        // SKLint consumes explicit SKxxx/SKDxxx selectors, DOCxxx aliases, and
-        // the deliberate T201 alias for SK201. Unrelated Flake8/Ruff codes keep
-        // their meaning.
+        // SKLint consumes explicit SKxxx/SKDxxx selectors and DOCxxx aliases.
+        // Foreign Ruff/Flake8 selectors keep their ownership.
         return Some(Vec::new());
     };
     let upper = rest.to_ascii_uppercase();
     let mut positioned = parse_csv_codes(rest)
         .into_iter()
-        .filter(|code| code.starts_with("SK") || code.eq_ignore_ascii_case("T201"))
+        .filter(|code| code.starts_with("SK"))
         .map(|code| (upper.find(&code).unwrap_or(usize::MAX), code))
         .collect::<Vec<_>>();
     positioned.extend(
@@ -548,10 +545,9 @@ fn remove_selector_from_segment(segment: &str, target: &str) -> String {
         if let Some(relative_colon) = segment[noqa_pos..].find(':') {
             let colon = noqa_pos + relative_colon;
             let prefix = &segment[..colon];
-            let kept = segment[colon + 1..]
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty() && item.to_ascii_uppercase() != target)
+            let kept = parse_csv_codes(&segment[colon + 1..])
+                .into_iter()
+                .filter(|item| item != &target)
                 .collect::<Vec<_>>();
             return if kept.is_empty() {
                 String::new()
@@ -585,6 +581,18 @@ fn remove_selector_from_segment(segment: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remover_handles_space_separated_noqa_selectors() {
+        assert_eq!(
+            remove_selector_from_segment("# noqa: RUF100 DOC601 DOC603", "DOC601"),
+            "# noqa: RUF100, DOC603"
+        );
+        assert_eq!(
+            remove_selector_from_segment("# noqa: DOC601 DOC603", "DOC601"),
+            "# noqa: DOC603"
+        );
+    }
 
     #[test]
     fn noqa_text_inside_python_string_is_not_treated_as_comment() {
@@ -643,11 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn noqa_consumes_sk_codes_and_t201_alias() {
+    fn noqa_leaves_foreign_t201_to_ruff() {
         let state = SuppressionState::parse("print(1)  # noqa: E501, T201, SK001\n");
         assert_eq!(state.suppressions.len(), 1);
-        assert_eq!(state.suppressions[0].codes, vec!["T201", "SK001"]);
-        assert_eq!(state.suppressing_ids_for(1, "SK201", None).len(), 1);
+        assert_eq!(state.suppressions[0].codes, vec!["SK001"]);
+        assert!(state.suppressing_ids_for(1, "SK201", None).is_empty());
     }
 
     #[test]
@@ -698,11 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn t201_alias_interoperates_with_sk201_block_enable_disable() {
+    fn foreign_t201_block_selector_does_not_control_sk201() {
         let state = SuppressionState::parse(
             "# sklint: disable T201\nprint(1)\n# sklint: enable SK201\nprint(2)\n",
         );
-        assert_eq!(state.suppressing_ids_for(2, "SK201", None).len(), 1);
+        assert!(state.suppressing_ids_for(2, "SK201", None).is_empty());
         assert!(state.suppressing_ids_for(4, "SK201", None).is_empty());
     }
 

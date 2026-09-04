@@ -68,6 +68,33 @@ class build_py(_build_py):
             marker = Path(self.build_lib) / "sklint" / "bin" / "TARGET"
             marker.write_text(f"{target}\n", encoding="utf-8")
 
+        rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+        try:
+            rustc_version = (
+                subprocess.check_output([rustc, "--version"], text=True).strip()
+                if rustc
+                else "unknown"
+            )
+        except (OSError, subprocess.CalledProcessError):
+            rustc_version = "unknown"
+        build_info = Path(self.build_lib) / "sklint" / "bin" / "BUILD_INFO.txt"
+        build_info.write_text(
+            "\n".join(
+                [
+                    f"version={os.environ.get('SKLINT_BUILD_VERSION', '0.1.49')}",
+                    f"revision={os.environ.get('SKLINT_BUILD_REVISION', 'development')}",
+                    f"source_tree_sha256={os.environ.get('SKLINT_SOURCE_TREE_SHA256', 'unknown')}",
+                    f"source_commit={os.environ.get('SKLINT_SOURCE_COMMIT', 'unknown')}",
+                    f"source_dirty={os.environ.get('SKLINT_SOURCE_DIRTY', 'unknown')}",
+                    f"rustc={rustc_version}",
+                    f"target={target or 'unknown'}",
+                    f"wheel_platform_tag={os.environ.get('SKLINT_WHEEL_PLATFORM_TAG', 'native')}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
 
 cmdclass = {"build_py": build_py}
 
@@ -81,6 +108,7 @@ if _bdist_wheel is not None:
 
         def get_tag(self) -> Tuple[str, str, str]:
             _python_tag, _abi_tag, platform_tag = super().get_tag()
+            platform_tag = os.environ.get("SKLINT_WHEEL_PLATFORM_TAG", platform_tag)
             return "py3", "none", platform_tag
 
     cmdclass["bdist_wheel"] = bdist_wheel

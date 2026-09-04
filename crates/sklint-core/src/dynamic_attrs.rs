@@ -1,6 +1,8 @@
 use crate::config::EffectiveConfig;
+use crate::dataclass_model::DataclassModel;
 use crate::diagnostic::{Diagnostic, Span};
-use std::collections::HashSet;
+use crate::python_ast::PythonAst;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -42,13 +44,41 @@ pub fn run_dynamic_attribute_rules(
     let display_path = path.display().to_string();
     let lines: Vec<&str> = source.lines().collect();
     let classes = collect_classes(&lines);
+    let project_declared = PythonAst::parse(source, &display_path)
+        .ok()
+        .map(|ast| DataclassModel::from_path(path, source, &ast))
+        .map(|model| {
+            model
+                .classes
+                .iter()
+                .map(|class| {
+                    (
+                        class.name.clone(),
+                        model.effective_declared_attrs(&class.name),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut diagnostics = Vec::new();
 
     if sk701_enabled {
-        run_self_dynamic_attribute_rule(&display_path, &lines, &classes, &mut diagnostics);
+        run_self_dynamic_attribute_rule(
+            &display_path,
+            &lines,
+            &classes,
+            &project_declared,
+            &mut diagnostics,
+        );
     }
     if sk702_enabled {
-        run_known_dynamic_object_attribute_rule(&display_path, &lines, &classes, &mut diagnostics);
+        run_known_dynamic_object_attribute_rule(
+            &display_path,
+            &lines,
+            &classes,
+            &project_declared,
+            &mut diagnostics,
+        );
     }
 
     diagnostics
@@ -58,6 +88,7 @@ fn run_self_dynamic_attribute_rule(
     display_path: &str,
     lines: &[&str],
     classes: &[ClassInfo],
+    project_declared: &HashMap<String, HashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (class_idx, class) in classes.iter().enumerate() {
@@ -72,7 +103,7 @@ fn run_self_dynamic_attribute_rule(
                 };
                 let code_part = strip_inline_comment(line);
                 for (attr, start_col, end_col) in self_attribute_assignment_occurrences(code_part) {
-                    if class_declares_attr(classes, class_idx, &attr) {
+                    if class_declares_attr(classes, class_idx, &attr, project_declared) {
                         continue;
                     }
                     if !emitted_attrs.insert(attr.clone()) {
@@ -98,6 +129,7 @@ fn run_known_dynamic_object_attribute_rule(
     display_path: &str,
     lines: &[&str],
     classes: &[ClassInfo],
+    project_declared: &HashMap<String, HashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let variables = collect_constructed_variables(lines, classes);
@@ -119,7 +151,7 @@ fn run_known_dynamic_object_attribute_rule(
             for (attr, start_col, end_col) in
                 object_attribute_occurrences(code_part, &variable.name)
             {
-                if class_declares_attr(classes, variable.class_idx, &attr) {
+                if class_declares_attr(classes, variable.class_idx, &attr, project_declared) {
                     continue;
                 }
                 let Some(end_index) = byte_index_for_column(code_part, end_col) else {
@@ -260,12 +292,21 @@ fn is_dynamic_attribute_container(classes: &[ClassInfo], class_idx: usize) -> bo
     })
 }
 
-fn class_declares_attr(classes: &[ClassInfo], class_idx: usize, attr: &str) -> bool {
+fn class_declares_attr(
+    classes: &[ClassInfo],
+    class_idx: usize,
+    attr: &str,
+    project_declared: &HashMap<String, HashSet<String>>,
+) -> bool {
     let class = &classes[class_idx];
-    class.declared_attrs.contains(attr)
+    project_declared
+        .get(&class.name)
+        .is_some_and(|attrs| attrs.contains(attr))
+        || class.declared_attrs.contains(attr)
         || class.bases.iter().any(|base| {
-            resolve_base_class(classes, class_idx, simple_name(base))
-                .is_some_and(|base_idx| class_declares_attr(classes, base_idx, attr))
+            resolve_base_class(classes, class_idx, simple_name(base)).is_some_and(|base_idx| {
+                class_declares_attr(classes, base_idx, attr, project_declared)
+            })
         })
 }
 
@@ -668,6 +709,8 @@ fn is_identifier(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{EffectiveConfig, FileInlineConfig, PyProjectConfig, VscodeConfig};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config() -> EffectiveConfig {
         config_with_select(&["SK701"])
@@ -699,6 +742,58 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn type_checking_class_annotations_count_as_declarations_for_sk701() {
+        let source = r#"from typing import TYPE_CHECKING
+
+class C:
+    if TYPE_CHECKING:
+        flag: bool
+
+    def run(self) -> None:
+        self.flag = True
+"#;
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert!(!diagnostics.iter().any(|diag| diag.code == "SK701"));
+    }
+
+    #[test]
+    fn ignores_attributes_declared_in_imported_base_initializer() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-dynamic-inherited-{unique}"));
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = true\n",
+        )
+        .expect("write pyproject");
+        fs::write(pkg.join("__init__.py"), "").expect("write init");
+        fs::write(
+            pkg.join("base.py"),
+            "class Base:\n    def __init__(self):\n        self.is_reading = False\n        self._is_open = False\n",
+        )
+        .expect("write base");
+        let child_path = pkg.join("child.py");
+        let child_source = "from .base import Base\n\nclass Child(Base):\n    def start(self):\n        self.is_reading = True\n        self._is_open = True\n        self.new_state = 1\n";
+        fs::write(&child_path, child_source).expect("write child");
+
+        let diagnostics = run_dynamic_attribute_rules(&child_path, child_source, &config());
+        assert!(!diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("is_reading")));
+        assert!(!diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("_is_open")));
+        assert!(diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("new_state")));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

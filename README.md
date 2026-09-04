@@ -9,9 +9,12 @@ Email: <stablekite@stablekite.com>
 
 # Теоретическая информация
 
-SKLint не заменяет Ruff, Pyright, Pylint, wemake, flake8 и pydoclint.  
+SKLint не заменяет Ruff, Pyright, Pylint, wemake или flake8. Встроенный Rust-native docstring semantic analyzer заменяет standalone pydoclint; legacy pydoclint-compatible names сохраняются только для migration compatibility.
+Для редких future-grammar gaps внешний CPython используется только как изолированный syntax oracle (`-I -S`) с жёстким timeout; конкретный interpreter можно закрепить через `SKLINT_PYTHON`.
 Его задача — добавлять только те проверки, которые нужны проекту и не закрываются существующими инструментами полностью.  
 Все основные правила, suppressions, автоисправления и форматтер реализованы в Rust-ядре `sklint-core`, а CLI, Python wrapper и VSCode расширение вызывают одно и то же API.
+
+> Linux release note: текущая glibc-сборка публикуется с PEP 600 tag `manylinux_2_39_x86_64`; она требует glibc >= 2.39. Для более старых дистрибутивов нужен отдельный older-baseline/musl build.
 
 # Общая информация о проекте
 
@@ -77,6 +80,16 @@ sklint explain SK601
 strict = false
 select = []
 ignore = []
+# Docstring semantics are first-class SKLint options. Legacy
+# [tool.pydoclint] / [tool.sklint.pydoclint] sections are migration aliases.
+allow_init_docstring = true
+should_document_private_class_attributes = false
+# Optional for wrapper-heavy projects that intentionally document exceptions
+# propagated by callees even when SKLint cannot prove the callee flow.
+allow_documented_propagated_exceptions = false
+
+# `ctypes.Structure`/`Union`: explicit Python annotations win over raw `_fields_`
+# storage types; ambiguous storage-only SKD605 diagnostics are never safe-fixed.
 
 [tool.ruff.lint]
 external = ["SK"]
