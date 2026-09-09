@@ -112,7 +112,14 @@ impl DataclassModel {
         let current = raw_module_from_ast(source, ast, &current_module, current_is_package);
 
         let mut modules = Vec::new();
+        // The current source buffer is already loaded below. Mark its module
+        // as queued so project-aware re-export/import chains cannot load the
+        // same file from disk a second time and duplicate current-module
+        // classes (and downstream diagnostics such as SK619).
         let mut queued = HashSet::new();
+        if !current_module.is_empty() {
+            queued.insert(current_module.clone());
+        }
         let mut queue = VecDeque::new();
         let mut requested = HashMap::<String, HashSet<String>>::new();
         queue_semantic_references(&root, &current, &mut queued, &mut queue, &mut requested);
@@ -1408,6 +1415,46 @@ class Item:
         let model = DataclassModel::from_path(&item_path, item_source, &ast);
         assert!(model.class("Item").unwrap().is_dataclass_like);
         assert_eq!(model.effective_fields("Item")[0].name, "value");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_model_does_not_reload_current_package_through_self_reference() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-current-module-dedup-{unique}"));
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = true\n",
+        )
+        .expect("write pyproject");
+        let current_path = pkg.join("__init__.py");
+        let current_source = r#"import pkg
+
+class Base:
+    pass
+
+class Child(pkg.Base):
+    pass
+"#;
+        fs::write(&current_path, current_source).expect("write current package");
+
+        let ast = PythonAst::parse(current_source, &current_path.display().to_string())
+            .expect("valid current package");
+        let model = DataclassModel::from_path(&current_path, current_source, &ast);
+        assert_eq!(
+            model
+                .classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Base", "Child"]
+        );
 
         let _ = fs::remove_dir_all(root);
     }

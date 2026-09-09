@@ -638,7 +638,10 @@ fn top_level_dependency_graph(
             let target = &defs[*target_idx];
             if lines[source.group_start.saturating_sub(1)..body_end]
                 .iter()
-                .any(|line| contains_top_level_format_reference(&line.code, &target.name))
+                .any(|line| {
+                    !format_line_is_in_deferred_function_body(line.no, lines, defs)
+                        && contains_top_level_format_reference(&line.code, &target.name)
+                })
             {
                 graph[source_pos].push(target_pos);
             }
@@ -681,11 +684,42 @@ fn contains_self_method_call(code: &str, name: &str) -> bool {
 }
 
 fn contains_top_level_format_reference(code: &str, name: &str) -> bool {
+    let trimmed = code.trim_start();
+    let bare_name_is_eager = trimmed.starts_with('@') || trimmed.starts_with("class ");
     code.match_indices(name).any(|(idx, _)| {
         let before = code[..idx].chars().next_back();
         let after = code[idx + name.len()..].chars().next();
-        before.is_none_or(|ch| !is_identifier_continue(ch)) && matches!(after, Some('(' | '.'))
+        let identifier_boundary = before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && after.is_none_or(|ch| !is_identifier_continue(ch));
+        if !identifier_boundary || format_reference_is_in_lambda_body(code, idx) {
+            return false;
+        }
+        bare_name_is_eager || matches!(after, Some('(' | '.'))
     })
+}
+
+fn format_reference_is_in_lambda_body(code: &str, reference_byte: usize) -> bool {
+    let prefix = &code[..reference_byte];
+    let Some(lambda_byte) = prefix.rfind("lambda") else {
+        return false;
+    };
+    let before = prefix[..lambda_byte].chars().next_back();
+    let after = prefix[lambda_byte + "lambda".len()..].chars().next();
+    if before.is_some_and(is_identifier_continue) || after.is_some_and(is_identifier_continue) {
+        return false;
+    }
+    prefix[lambda_byte + "lambda".len()..].contains(':')
+}
+
+fn format_line_is_in_deferred_function_body(
+    line_no: usize,
+    lines: &[FormatLine],
+    defs: &[FormatDef],
+) -> bool {
+    defs.iter()
+        .filter(|def| def.kind == FormatDefKind::Function)
+        .filter(|def| def.start < line_no && line_no <= def.end)
+        .any(|def| line_no > format_header_end_line(lines, def.start))
 }
 
 fn split_preserving_logical_lines(source: &str) -> Vec<String> {
@@ -989,6 +1023,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formatter_does_not_create_dangling_platform_binding_in_decorator() {
+        let source = "from sys import platform\n\n@marker(platform == \"win32\")\ndef f() -> bool:\n    if platform == \"win32\":\n        a()\n        b()\n    else:\n        c()\n        d()\n    return True\n";
+        let report = format_source(
+            PathBuf::from("example.py"),
+            source.to_string(),
+            VscodeConfig {
+                select: vec!["SK504".to_string()],
+                ..VscodeConfig::default()
+            },
+        );
+        assert_eq!(
+            report.source.trim_end_matches('\n'),
+            source.trim_end_matches('\n')
+        );
+        assert!(report.source.contains("from sys import platform"));
+        assert!(report.source.contains("@marker(platform == \"win32\")"));
+        assert!(report.source.contains("if platform == \"win32\":"));
+    }
+
+    #[test]
     fn removes_trailing_whitespace() {
         let report = format_source(
             PathBuf::from("example.py"),
@@ -1120,7 +1174,8 @@ mod tests {
 
     #[test]
     fn batches_top_level_dependency_moves_in_one_ordering_stage() {
-        let source = "def build_box():\n    return Box()\n\ndef build_item():\n    return Item()\n\nclass Box:\n    pass\n\nclass Item:\n    pass\n";
+        let source =
+            "box = Box()\nitem = Item()\n\nclass Box:\n    pass\n\nclass Item:\n    pass\n";
         let analysis = analyze(AnalysisInput {
             path: PathBuf::from("example.py"),
             source: source.to_string(),
@@ -1211,7 +1266,7 @@ mod tests {
 
     #[test]
     fn reorders_top_level_definitions() {
-        let source = "def build():\n    return Box()\n\nclass Box:\n    pass\n";
+        let source = "def build(value = Box()):\n    return value\n\nclass Box:\n    pass\n";
         let report = format_source(
             PathBuf::from("example.py"),
             source.to_string(),
@@ -1273,8 +1328,8 @@ mod tests {
     }
 
     #[test]
-    fn sk505_cycles_keep_stable_order_and_allow_other_safe_fixes() {
-        let source = "\"\"\"\nОписание модуля\n\"\"\"\nvalue=1\n\n\ndef build() -> Box:\n    return Box()\n\n\nclass Box:\n    def clone(self) -> Box:\n        return build()";
+    fn sk505_deferred_body_reference_does_not_force_reorder_and_other_safe_fixes_apply() {
+        let source = "\"\"\"\nОписание модуля\n\"\"\"\nvalue=1\n\n\ndef build() -> \"Box\":\n    return Box()\n\n\nclass Box:\n    pass";
         let report = format_source(
             PathBuf::from("example.py"),
             source.to_string(),

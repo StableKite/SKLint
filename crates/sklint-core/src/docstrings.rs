@@ -95,7 +95,22 @@ pub fn run_docstring_rules(path: &Path, source: &str, config: &EffectiveConfig) 
             &mut diagnostics,
         );
     }
+    dedup_exact_sk619(&mut diagnostics);
     diagnostics
+}
+
+fn dedup_exact_sk619(diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen = Vec::<Diagnostic>::new();
+    diagnostics.retain(|diagnostic| {
+        if diagnostic.code != "SK619" {
+            return true;
+        }
+        if seen.iter().any(|existing| existing == diagnostic) {
+            return false;
+        }
+        seen.push(diagnostic.clone());
+        true
+    });
 }
 
 fn wrap_plain_docstring_line(line: &str, max_columns: usize) -> Option<String> {
@@ -1498,7 +1513,6 @@ fn is_module_docstring(lines: &[&str], idx: usize) -> bool {
 
 fn is_nested_owner(lines: &[&str], owner_idx: usize) -> bool {
     let owner_indent = indent_width(lines[owner_idx]);
-    let mut saw_class_at_parent = false;
     for line in lines[..owner_idx].iter().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
@@ -1508,21 +1522,23 @@ fn is_nested_owner(lines: &[&str], owner_idx: usize) -> bool {
         if indent >= owner_indent {
             continue;
         }
+
+        // The first less-indented definition is the lexical parent relevant to
+        // nested-docstring policy. Do not scan past a sibling boundary: doing
+        // so leaks traversal state from an unrelated earlier top-level
+        // function into a later class method.
         if parse_def_name(trimmed).is_some() {
             return true;
         }
         if parse_class_header(trimmed).is_some() {
-            saw_class_at_parent = true;
-            continue;
+            // A method directly inside a class is not treated as a nested
+            // object for the one-line nested-docstring rules. Preserve the
+            // existing policy for deeper definitions.
+            return owner_indent > 4;
         }
         if indent == 0 {
             break;
         }
-    }
-    // A method directly inside a class is not treated as a nested object for
-    // one-line nested-docstring rules. Inner classes/functions still are.
-    if saw_class_at_parent && owner_indent == 4 {
-        return false;
     }
     owner_indent > 4
 }
@@ -2457,6 +2473,71 @@ class Node:
             .find(|diagnostic| diagnostic.code == "SK614")
             .expect("SK614 diagnostic");
         assert!(diagnostic.fix.is_none());
+    }
+
+    #[test]
+    fn sk608_is_independent_of_previous_top_level_sibling_kind() {
+        let class = "class C:\n    \"\"\"\n    Проверочный класс\n    \"\"\"\n\n    def m(self) -> None:\n        \"\"\"\n        Короткая документация\n        \"\"\"";
+        let prefixes = [
+            "",
+            "VALUE = 1\n\n",
+            "class A:\n    \"\"\"Первый класс\"\"\"\n\n",
+            "def helper() -> None:\n    \"\"\"Вспомогательная функция\"\"\"\n\n\n",
+            "async def helper() -> None:\n    \"\"\"Вспомогательная функция\"\"\"\n\n\n",
+            "@decorator\ndef helper() -> None:\n    \"\"\"Вспомогательная функция\"\"\"\n\n\n",
+            "class A:\n    \"\"\"Первый класс\"\"\"\n\ndef helper() -> None:\n    \"\"\"Вспомогательная функция\"\"\"\n\n\n",
+            "def first() -> None:\n    \"\"\"Первая функция\"\"\"\n\n\ndef second() -> None:\n    \"\"\"Вторая функция\"\"\"\n\n\n",
+        ];
+
+        for prefix in prefixes {
+            let source = format!("\"\"\"Проверка\"\"\"\n{prefix}{class}");
+            let count = codes(&source)
+                .into_iter()
+                .filter(|code| code == "SK608")
+                .count();
+            assert_eq!(count, 0, "SK608 must not leak across siblings:\n{source}");
+        }
+    }
+
+    #[test]
+    fn exact_sk619_duplicates_are_removed_without_touching_distinct_diagnostics() {
+        let base = Diagnostic::new(
+            "SK619",
+            "Attributes section order does not match dataclass field order",
+            "example.py",
+            Span::new(10, 1, 10, 1),
+            "warning",
+        );
+        let distinct = Diagnostic::new(
+            "SK619",
+            "Attributes section order does not match dataclass field order",
+            "example.py",
+            Span::new(20, 1, 20, 1),
+            "warning",
+        );
+        let unrelated = Diagnostic::new(
+            "SKD602",
+            "Other diagnostic",
+            "example.py",
+            Span::new(10, 1, 10, 1),
+            "warning",
+        );
+        let mut diagnostics = vec![base.clone(), base, distinct.clone(), unrelated.clone()];
+
+        dedup_exact_sk619(&mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(
+            diagnostics.iter().filter(|diag| *diag == &distinct).count(),
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diag| *diag == &unrelated)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::config::EffectiveConfig;
+use crate::config::{name_matches_pattern, EffectiveConfig};
 use crate::diagnostic::{Diagnostic, Fix, Span};
 use crate::identifier::{is_identifier_continue, is_identifier_start};
 use std::collections::{BTreeSet, HashMap};
@@ -62,7 +62,7 @@ pub fn run_syntax_rules(path: &Path, source: &str, config: &EffectiveConfig) -> 
         run_special_method_order(&display_path, &defs, &mut diagnostics);
     }
     if config.is_enabled("SK506") {
-        run_try_blocks(&display_path, &lines, &mut diagnostics);
+        run_try_blocks(&display_path, &lines, &defs, config, &mut diagnostics);
     }
     if config.is_enabled("SK510") {
         run_contextlib_suppress(&display_path, &lines, &mut diagnostics);
@@ -956,44 +956,116 @@ fn run_sys_platform_import(
                 .find("platform")
                 .map(|idx| byte_to_column(&line.text, idx))
                 .unwrap_or(1);
-            diagnostics.push(
-                Diagnostic::new(
-                    "SK504",
-                    "Use import sys and sys.platform so type checkers can narrow platform branches",
-                    display_path,
-                    Span::new(line.no, col, line.no, col + "platform".len()),
-                    "warning",
-                )
-                .with_fix(Fix {
+            let diagnostic = Diagnostic::new(
+                "SK504",
+                "Use import sys and sys.platform so type checkers can narrow platform branches",
+                display_path,
+                Span::new(line.no, col, line.no, col + "platform".len()),
+                "warning",
+            );
+            if let Some(replacement) = rewrite_platform_import(source) {
+                diagnostics.push(diagnostic.with_fix(Fix {
                     safe: true,
                     message: "Rewrite platform import to sys.platform".to_string(),
-                    replacement: rewrite_platform_import(source),
+                    replacement,
                     start_line: 1,
                     start_column: 1,
                     end_line: source_line_count(source),
                     end_column: last_line_column(source),
-                }),
-            );
+                }));
+            } else {
+                diagnostics.push(diagnostic);
+            }
         }
     }
 }
 
-fn rewrite_platform_import(source: &str) -> String {
-    source
-        .lines()
+fn rewrite_platform_import(source: &str) -> Option<String> {
+    let lines = line_infos(source);
+    let mut import_count = 0usize;
+
+    for line in &lines {
+        let trimmed = line.code.trim();
+        if trimmed == "from sys import platform" {
+            import_count += 1;
+            continue;
+        }
+
+        let uses = count_unqualified_word_uses(&line.code, "platform");
+        if uses == 0 {
+            continue;
+        }
+
+        let code = line.code.trim_start();
+        let supported_guard = code.starts_with("if platform") || code.starts_with("elif platform");
+        if !supported_guard || uses != 1 {
+            return None;
+        }
+    }
+
+    if import_count != 1 {
+        return None;
+    }
+
+    let mut rewritten = lines
+        .iter()
         .map(|line| {
-            if line.trim() == "from sys import platform" {
-                "import sys".to_string()
-            } else if line.trim_start().starts_with("if platform")
-                || line.trim_start().starts_with("elif platform")
+            if line.code.trim() == "from sys import platform" {
+                let indent = &line.text[..line.text.len() - line.text.trim_start().len()];
+                format!("{indent}import sys")
+            } else if line.code.trim_start().starts_with("if platform")
+                || line.code.trim_start().starts_with("elif platform")
             {
-                line.replacen("platform", "sys.platform", 1)
+                replace_unqualified_word_once(&line.text, "platform", "sys.platform")
             } else {
-                line.to_string()
+                line.text.clone()
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if source.ends_with('\n') && !rewritten.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    Some(rewritten)
+}
+
+fn count_unqualified_word_uses(text: &str, word: &str) -> usize {
+    let mut count = 0usize;
+    let mut idx = 0usize;
+    while let Some(pos) = text[idx..].find(word) {
+        let start = idx + pos;
+        let end = start + word.len();
+        let before = char_before(text, start);
+        let after = text[end..].chars().next();
+        if before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && after.is_none_or(|ch| !is_identifier_continue(ch))
+        {
+            count += 1;
+        }
+        idx = end;
+    }
+    count
+}
+
+fn replace_unqualified_word_once(text: &str, word: &str, replacement: &str) -> String {
+    let mut idx = 0usize;
+    while let Some(pos) = text[idx..].find(word) {
+        let start = idx + pos;
+        let end = start + word.len();
+        let before = char_before(text, start);
+        let after = text[end..].chars().next();
+        if before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && after.is_none_or(|ch| !is_identifier_continue(ch))
+        {
+            let mut out = String::with_capacity(text.len() + replacement.len() - word.len());
+            out.push_str(&text[..start]);
+            out.push_str(replacement);
+            out.push_str(&text[end..]);
+            return out;
+        }
+        idx = end;
+    }
+    text.to_string()
 }
 
 fn run_definition_order(
@@ -1018,10 +1090,13 @@ fn run_top_level_definition_order(
             continue;
         }
         for line in lines.iter().take(def.start.saturating_sub(1)) {
+            if line_is_in_deferred_function_body(line.no, lines, defs) {
+                continue;
+            }
             if contains_top_level_definition_reference(&line.code, &def.name) {
                 diagnostics.push(Diagnostic::new(
                     "SK505",
-                    "Definitions must appear before their first use",
+                    "Definitions must appear before their first eager use",
                     display_path,
                     Span::new(line.no, 1, line.no, line.text.chars().count().max(1)),
                     "warning",
@@ -1032,12 +1107,39 @@ fn run_top_level_definition_order(
     }
 }
 
+fn line_is_in_deferred_function_body(line_no: usize, lines: &[LineInfo], defs: &[DefInfo]) -> bool {
+    defs.iter()
+        .filter(|def| def.kind == DefKind::Function)
+        .filter(|def| def.start < line_no && line_no <= def.end)
+        .any(|def| line_no > header_end_line(lines, def.start))
+}
+
 fn contains_top_level_definition_reference(code: &str, name: &str) -> bool {
+    let trimmed = code.trim_start();
+    let bare_name_is_eager = trimmed.starts_with('@') || trimmed.starts_with("class ");
     code.match_indices(name).any(|(idx, _)| {
         let before = code[..idx].chars().next_back();
         let after = code[idx + name.len()..].chars().next();
-        before.is_none_or(|ch| !is_identifier_continue(ch)) && matches!(after, Some('(' | '.'))
+        let identifier_boundary = before.is_none_or(|ch| !is_identifier_continue(ch) && ch != '.')
+            && after.is_none_or(|ch| !is_identifier_continue(ch));
+        if !identifier_boundary || reference_is_in_lambda_body(code, idx) {
+            return false;
+        }
+        bare_name_is_eager || matches!(after, Some('(' | '.'))
     })
+}
+
+fn reference_is_in_lambda_body(code: &str, reference_byte: usize) -> bool {
+    let prefix = &code[..reference_byte];
+    let Some(lambda_byte) = prefix.rfind("lambda") else {
+        return false;
+    };
+    let before = prefix[..lambda_byte].chars().next_back();
+    let after = prefix[lambda_byte + "lambda".len()..].chars().next();
+    if before.is_some_and(is_identifier_continue) || after.is_some_and(is_identifier_continue) {
+        return false;
+    }
+    prefix[lambda_byte + "lambda".len()..].contains(':')
 }
 
 fn run_method_definition_order(
@@ -1126,13 +1228,32 @@ fn special_method_phase(name: &str) -> usize {
     }
 }
 
-fn run_try_blocks(display_path: &str, lines: &[LineInfo], diagnostics: &mut Vec<Diagnostic>) {
+fn run_try_blocks(
+    display_path: &str,
+    lines: &[LineInfo],
+    defs: &[DefInfo],
+    config: &EffectiveConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let exception_boundaries =
+        exception_boundary_def_indices(lines, defs, &config.exception_boundary_functions);
     for line in lines {
         let trimmed = line.code.trim_start();
         if trimmed.starts_with("try:")
             || trimmed.starts_with("except")
             || trimmed.starts_with("finally:")
         {
+            let current_def = defs
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| {
+                    def.kind == DefKind::Function && def.start < line.no && line.no <= def.end
+                })
+                .max_by_key(|(_, def)| def.indent)
+                .map(|(index, _)| index);
+            if current_def.is_some_and(|index| exception_boundaries.contains(&index)) {
+                continue;
+            }
             diagnostics.push(Diagnostic::new(
                 "SK506",
                 "try, except and finally blocks are forbidden in hot runtime code",
@@ -1147,6 +1268,101 @@ fn run_try_blocks(display_path: &str, lines: &[LineInfo], diagnostics: &mut Vec<
             ));
         }
     }
+}
+
+fn exception_boundary_def_indices(
+    lines: &[LineInfo],
+    defs: &[DefInfo],
+    configured_patterns: &[String],
+) -> BTreeSet<usize> {
+    const BUILTIN_BOUNDARIES: &[&str] = &[
+        "close",
+        "shutdown",
+        "cleanup",
+        "teardown",
+        "rollback",
+        "release",
+        "__exit__",
+        "__aexit__",
+    ];
+
+    let mut allowed = defs
+        .iter()
+        .enumerate()
+        .filter(|(_, def)| def.kind == DefKind::Function)
+        .filter(|(_, def)| {
+            BUILTIN_BOUNDARIES.contains(&def.name.as_str())
+                || configured_patterns
+                    .iter()
+                    .any(|pattern| name_matches_pattern(&def.name, pattern))
+        })
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+
+    // Propagate boundary semantics through private helpers, but only when all
+    // observed callers are themselves recognized boundaries. This preserves
+    // SK506 if a helper is shared with an ordinary runtime/hot path.
+    loop {
+        let mut newly_allowed = Vec::new();
+        for (index, def) in defs.iter().enumerate() {
+            if def.kind != DefKind::Function
+                || allowed.contains(&index)
+                || !def.name.starts_with('_')
+            {
+                continue;
+            }
+            let users = private_helper_users(index, lines, defs);
+            if !users.is_empty() && users.iter().all(|user| allowed.contains(user)) {
+                newly_allowed.push(index);
+            }
+        }
+        if newly_allowed.is_empty() {
+            break;
+        }
+        allowed.extend(newly_allowed);
+    }
+
+    allowed
+}
+
+fn private_helper_users(def_index: usize, lines: &[LineInfo], defs: &[DefInfo]) -> BTreeSet<usize> {
+    let def = &defs[def_index];
+    let mut users = BTreeSet::new();
+
+    let parent_class = def
+        .parent
+        .filter(|parent| defs[*parent].kind == DefKind::Class);
+    if let Some(class_index) = parent_class {
+        let needle = format!("self.{}(", def.name);
+        for (index, user) in defs.iter().enumerate().filter(|(_, user)| {
+            user.kind == DefKind::Function
+                && user.parent == Some(class_index)
+                && user.start != def.start
+        }) {
+            if lines[user.start - 1..user.end.min(lines.len())]
+                .iter()
+                .any(|line| line.code.contains(&needle))
+            {
+                users.insert(index);
+            }
+        }
+        return users;
+    }
+
+    if def.parent.is_none() {
+        for (index, user) in defs.iter().enumerate().filter(|(_, user)| {
+            user.kind == DefKind::Function && user.parent.is_none() && user.start != def.start
+        }) {
+            if lines[user.start - 1..user.end.min(lines.len())]
+                .iter()
+                .any(|line| find_bare_call(&line.code, &def.name).is_some())
+            {
+                users.insert(index);
+            }
+        }
+    }
+
+    users
 }
 
 fn run_contextlib_suppress(
@@ -1338,18 +1554,44 @@ fn run_raise_hot_path(
             allowed.contains(&def.name.as_str())
                 || def.name.starts_with('_')
                     && private_method_only_used_by_allowed(def, lines, defs, &allowed)
+                || is_module_getattr_attribute_error_raise(def, lines, after_raise)
         });
         if allowed_here {
             continue;
         }
         diagnostics.push(Diagnostic::new(
             "SK507",
-            "raise is allowed only in __init__, __post_init__, run, close, or private helpers used by them",
+            "raise is allowed only in lifecycle methods/private helpers or as AttributeError in module __getattr__",
             display_path,
             Span::new(line.no, line.indent + 1, line.no, line.indent + 6),
             "warning",
         ));
     }
+}
+
+fn is_module_getattr_attribute_error_raise(
+    def: &DefInfo,
+    lines: &[LineInfo],
+    after_raise: &str,
+) -> bool {
+    if def.name != "__getattr__" || def.indent != 0 || def.parent.is_some() {
+        return false;
+    }
+    let Some(header) = lines.get(def.start.saturating_sub(1)) else {
+        return false;
+    };
+    if !header.code.trim_start().starts_with("def __getattr__") {
+        return false;
+    }
+    let expression = after_raise.trim_start();
+    let Some(rest) = expression.strip_prefix("AttributeError") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace() || ch == '(')
 }
 
 fn private_method_only_used_by_allowed(
@@ -2287,8 +2529,10 @@ fn byte_to_column(text: &str, byte_idx: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::VscodeConfig;
+    use super::{rewrite_platform_import, run_syntax_rules};
+    use crate::config::{EffectiveConfig, FileInlineConfig, PyProjectConfig, VscodeConfig};
     use crate::{analyze, AnalysisInput};
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn codes(source: &str, strict: bool) -> Vec<String> {
@@ -2305,6 +2549,26 @@ mod tests {
         .into_iter()
         .map(|diag| diag.code)
         .collect()
+    }
+
+    fn syntax_codes_with_boundaries(source: &str, boundaries: &[&str]) -> Vec<String> {
+        let config = EffectiveConfig::resolve(
+            &VscodeConfig::default(),
+            &PyProjectConfig {
+                has_sklint_section: true,
+                strict: Some(true),
+                exception_boundary_functions: boundaries
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+                ..PyProjectConfig::default()
+            },
+            &FileInlineConfig::default(),
+        );
+        run_syntax_rules(Path::new("example.py"), source, &config)
+            .into_iter()
+            .map(|diag| diag.code)
+            .collect()
     }
 
     #[test]
@@ -2352,6 +2616,85 @@ mod tests {
         let source =
             "def suppress(error):\n    return error\n\n\ndef f():\n    suppress(ValueError)\n";
         assert!(!codes(source, true).contains(&"SK510".to_string()));
+    }
+
+    #[test]
+    fn sk506_keeps_generic_runtime_try_except_forbidden() {
+        let source = r#"def transform(data):
+    try:
+        return parse(data)
+    except ValueError:
+        return None
+"#;
+        assert!(codes(source, true).contains(&"SK506".to_string()));
+    }
+
+    #[test]
+    fn sk506_allows_explicit_try_except_in_builtin_lifecycle_boundaries() {
+        let source = r#"class Resource:
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        except OSError:
+            pass
+"#;
+        assert!(!codes(source, true).contains(&"SK506".to_string()));
+    }
+
+    #[test]
+    fn sk506_propagates_boundary_context_through_private_helpers_only() {
+        let source = r#"class Resource:
+    def close(self) -> None:
+        self._rollback_native_state()
+
+    def _rollback_native_state(self) -> None:
+        try:
+            native_rollback()
+        except OSError:
+            pass
+"#;
+        assert!(!codes(source, true).contains(&"SK506".to_string()));
+
+        let shared = r#"class Resource:
+    def close(self) -> None:
+        self._translate()
+
+    def process(self) -> None:
+        self._translate()
+
+    def _translate(self) -> None:
+        try:
+            native_call()
+        except OSError:
+            pass
+"#;
+        assert!(codes(shared, true).contains(&"SK506".to_string()));
+    }
+
+    #[test]
+    fn sk506_accepts_project_configured_exception_boundary_patterns() {
+        let source = r#"def _rollback_native_state() -> None:
+    try:
+        native_rollback()
+    except OSError:
+        pass
+"#;
+        assert!(syntax_codes_with_boundaries(source, &[]).contains(&"SK506".to_string()));
+        assert!(
+            !syntax_codes_with_boundaries(source, &["_rollback_*"]).contains(&"SK506".to_string())
+        );
+    }
+
+    #[test]
+    fn sk510_remains_forbidden_inside_lifecycle_boundaries() {
+        let source = r#"from contextlib import suppress
+
+class Resource:
+    def close(self) -> None:
+        with suppress(OSError):
+            self._handle.close()
+"#;
+        assert!(codes(source, true).contains(&"SK510".to_string()));
     }
 
     #[test]
@@ -2469,6 +2812,26 @@ mod tests {
     }
 
     #[test]
+    fn sk507_allows_attribute_error_in_module_getattr_protocol_hook_only() {
+        let allowed = "def __getattr__(name: str) -> object:\n    if name == \"dynamic\":\n        return 1\n    raise AttributeError(name)\n";
+        assert!(!codes(allowed, true).contains(&"SK507".to_string()));
+
+        let wrong_exception =
+            "def __getattr__(name: str) -> object:\n    raise RuntimeError(name)\n";
+        assert!(codes(wrong_exception, true).contains(&"SK507".to_string()));
+
+        let ordinary = "def ordinary_function() -> None:\n    raise AttributeError(\"x\")\n";
+        assert!(codes(ordinary, true).contains(&"SK507".to_string()));
+
+        let method = "class Box:\n    def __getattr__(self, name: str) -> object:\n        raise AttributeError(name)\n";
+        assert!(codes(method, true).contains(&"SK507".to_string()));
+
+        let async_module =
+            "async def __getattr__(name: str) -> object:\n    raise AttributeError(name)\n";
+        assert!(codes(async_module, true).contains(&"SK507".to_string()));
+    }
+
+    #[test]
     fn sk801_counts_uses_across_the_remaining_lexical_scope() {
         let source = r#"def rotate(v1, npv2):
     attitude = make_attitude()
@@ -2542,6 +2905,60 @@ mod tests {
     fn strict_catches_append_loop() {
         let found = codes("def f(items):\n    out = []\n    for item in items:\n        out.append(item.value)\n    return out\n", true);
         assert!(found.contains(&"SK803".to_string()));
+    }
+
+    #[test]
+    fn sk504_safe_fix_rewrites_simple_platform_guards_completely() {
+        let vscode_config = VscodeConfig {
+            select: vec!["SK504".to_string()],
+            ..VscodeConfig::default()
+        };
+        let report = analyze(AnalysisInput {
+            path: PathBuf::from("example.py"),
+            source: "from sys import platform\n\nif platform == \"win32\":\n    pass\n".to_string(),
+            vscode_config,
+        });
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SK504")
+            .expect("SK504 diagnostic");
+        let fix = diagnostic.fix.as_ref().expect("simple guard has safe fix");
+        assert!(fix.safe);
+        assert!(fix.replacement.contains("import sys"));
+        assert!(fix.replacement.contains("if sys.platform == \"win32\":"));
+        assert!(!fix.replacement.contains("from sys import platform"));
+    }
+
+    #[test]
+    fn sk504_fix_is_fail_closed_when_decorator_still_uses_platform_binding() {
+        let vscode_config = VscodeConfig {
+            select: vec!["SK504".to_string()],
+            ..VscodeConfig::default()
+        };
+        let source = "from sys import platform\n\n@marker(platform == \"win32\")\ndef f() -> bool:\n    if platform == \"win32\":\n        a()\n        b()\n    else:\n        c()\n        d()\n    return True\n";
+        let report = analyze(AnalysisInput {
+            path: PathBuf::from("example.py"),
+            source: source.to_string(),
+            vscode_config,
+        });
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SK504")
+            .expect("SK504 diagnostic");
+        assert!(diagnostic.fix.is_none());
+    }
+
+    #[test]
+    fn sk504_fix_is_fail_closed_for_other_binding_locations() {
+        for source in [
+            "from sys import platform\n\ndef f(value=platform):\n    if platform == \"win32\":\n        return value\n",
+            "from sys import platform\n\ndef f(platform):\n    if platform == \"win32\":\n        return True\n",
+            "from sys import platform\n\nvalue = [platform for _ in range(1)]\nif platform == \"win32\":\n    pass\n",
+        ] {
+            assert!(rewrite_platform_import(source).is_none(), "{source}");
+        }
     }
 
     #[test]
@@ -2646,6 +3063,36 @@ print(sys.executable)
             false,
         );
         assert!(!found.contains(&"SK505".to_string()));
+    }
+
+    #[test]
+    fn sk505_allows_deferred_function_method_async_and_lambda_body_lookups() {
+        for source in [
+            "def make() -> \"B\":\n    return B()\n\nclass B:\n    pass\n",
+            "class A:\n    def make(self) -> \"B\":\n        return B()\n\nclass B:\n    pass\n",
+            "async def make() -> \"B\":\n    return B()\n\nclass B:\n    pass\n",
+            "make = lambda: B()\n\nclass B:\n    pass\n",
+        ] {
+            assert!(
+                !codes(source, false).contains(&"SK505".to_string()),
+                "deferred lookup must not be SK505: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sk505_keeps_eager_definition_phase_references_checked() {
+        for source in [
+            "INSTANCE = B()\n\nclass B:\n    pass\n",
+            "def make(value = B()):\n    return value\n\nclass B:\n    pass\n",
+            "@register(B)\ndef make():\n    pass\n\nclass B:\n    pass\n",
+            "class A(B):\n    pass\n\nclass B:\n    pass\n",
+        ] {
+            assert!(
+                codes(source, false).contains(&"SK505".to_string()),
+                "eager lookup must remain SK505: {source}"
+            );
+        }
     }
 
     #[test]

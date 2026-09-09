@@ -1,5 +1,7 @@
 use crate::config::{parse_csv_codes, sklint_directive};
+use crate::python_ast::PythonAst;
 use crate::rules::code_matches_selector;
+use rustpython_parser::ast::{self, Stmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuppressionKind {
@@ -19,6 +21,9 @@ pub struct Suppression {
     pub hits: usize,
     pub selector_hits: Vec<usize>,
     pub catch_all_hits: usize,
+    /// Optional multiline simple-statement scope for explicit SK901 local
+    /// suppressions placed on the statement's first or closing line.
+    pub statement_scope: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +73,7 @@ impl SuppressionState {
                             hits: 0,
                             selector_hits,
                             catch_all_hits: 0,
+                            statement_scope: None,
                         });
                     }
                 }
@@ -88,6 +94,7 @@ impl SuppressionState {
                             hits: 0,
                             selector_hits,
                             catch_all_hits: 0,
+                            statement_scope: None,
                         });
                     }
                 }
@@ -116,6 +123,7 @@ impl SuppressionState {
                         hits: 0,
                         selector_hits,
                         catch_all_hits: 0,
+                        statement_scope: None,
                     });
                 } else if lower.starts_with("disable") {
                     let codes_text = directive
@@ -136,6 +144,7 @@ impl SuppressionState {
                         hits: 0,
                         selector_hits: vec![0; codes.len()],
                         catch_all_hits: 0,
+                        statement_scope: None,
                     });
                     block_events.push(BlockEvent {
                         suppression_id: Some(id),
@@ -164,6 +173,8 @@ impl SuppressionState {
                 first_code_line_seen = true;
             }
         }
+
+        attach_statement_scopes(source, &mut suppressions);
 
         Self {
             suppressions,
@@ -201,7 +212,13 @@ impl SuppressionState {
             }
             let applies_here = match suppression.kind {
                 SuppressionKind::File => true,
-                SuppressionKind::LineNoqa | SuppressionKind::LineSklint => suppression.line == line,
+                SuppressionKind::LineNoqa | SuppressionKind::LineSklint => {
+                    suppression.line == line
+                        || (code == "SK901"
+                            && suppression
+                                .statement_scope
+                                .is_some_and(|(start, end)| start <= line && line <= end))
+                }
                 SuppressionKind::Block => false,
             };
             if applies_here {
@@ -307,6 +324,132 @@ impl SuppressionState {
 
         active
     }
+}
+
+fn attach_statement_scopes(source: &str, suppressions: &mut [Suppression]) {
+    let Ok(ast) = PythonAst::parse(source, "<suppression-scope>") else {
+        return;
+    };
+    let mut ranges = Vec::new();
+    collect_simple_statement_ranges(&ast.suite, &ast, &mut ranges);
+
+    for suppression in suppressions {
+        if !matches!(
+            suppression.kind,
+            SuppressionKind::LineNoqa | SuppressionKind::LineSklint
+        ) || !suppression
+            .codes
+            .iter()
+            .any(|selector| code_matches_selector("SK901", selector))
+        {
+            continue;
+        }
+
+        suppression.statement_scope = ranges
+            .iter()
+            .copied()
+            .filter(|(start, end)| {
+                *start < *end && (suppression.line == *start || suppression.line == *end)
+            })
+            .filter(|(start, end)| *start <= suppression.line && suppression.line <= *end)
+            .min_by_key(|(start, end)| end - start);
+    }
+}
+
+fn collect_simple_statement_ranges(
+    statements: &[Stmt],
+    ast: &PythonAst,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    for statement in statements {
+        if is_statement_scope_owner(statement) {
+            let start = ast.location_of(statement).line;
+            let end = ast.end_location_of(statement).line;
+            if end > start {
+                ranges.push((start, end));
+            }
+        }
+
+        match statement {
+            Stmt::FunctionDef(node) => collect_simple_statement_ranges(&node.body, ast, ranges),
+            Stmt::AsyncFunctionDef(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges)
+            }
+            Stmt::ClassDef(node) => collect_simple_statement_ranges(&node.body, ast, ranges),
+            Stmt::For(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+            }
+            Stmt::AsyncFor(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+            }
+            Stmt::While(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+            }
+            Stmt::If(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+            }
+            Stmt::With(node) => collect_simple_statement_ranges(&node.body, ast, ranges),
+            Stmt::AsyncWith(node) => collect_simple_statement_ranges(&node.body, ast, ranges),
+            Stmt::Match(node) => {
+                for case in &node.cases {
+                    collect_simple_statement_ranges(&case.body, ast, ranges);
+                }
+            }
+            Stmt::Try(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_simple_statement_ranges(&handler.body, ast, ranges);
+                }
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+                collect_simple_statement_ranges(&node.finalbody, ast, ranges);
+            }
+            Stmt::TryStar(node) => {
+                collect_simple_statement_ranges(&node.body, ast, ranges);
+                for handler in &node.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_simple_statement_ranges(&handler.body, ast, ranges);
+                }
+                collect_simple_statement_ranges(&node.orelse, ast, ranges);
+                collect_simple_statement_ranges(&node.finalbody, ast, ranges);
+            }
+            Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::Assign(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Global(_)
+            | Stmt::Nonlocal(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_) => {}
+        }
+    }
+}
+
+fn is_statement_scope_owner(statement: &Stmt) -> bool {
+    matches!(
+        statement,
+        Stmt::Return(_)
+            | Stmt::Delete(_)
+            | Stmt::Assign(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::AugAssign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Expr(_)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,14 +585,15 @@ fn parse_noqa(comment: &str) -> Option<Vec<String>> {
         // Foreign Ruff/Flake8 selectors keep their ownership.
         return Some(Vec::new());
     };
-    let upper = rest.to_ascii_uppercase();
-    let mut positioned = parse_csv_codes(rest)
+    let (selectors, _) = split_noqa_reason(rest);
+    let upper = selectors.to_ascii_uppercase();
+    let mut positioned = parse_csv_codes(selectors)
         .into_iter()
         .filter(|code| code.starts_with("SK"))
         .map(|code| (upper.find(&code).unwrap_or(usize::MAX), code))
         .collect::<Vec<_>>();
     positioned.extend(
-        extract_native_doc_codes(rest)
+        extract_native_doc_codes(selectors)
             .into_iter()
             .map(|code| (upper.find(&code).unwrap_or(usize::MAX), code)),
     );
@@ -489,6 +633,19 @@ fn extract_native_doc_codes(text: &str) -> Vec<String> {
     }
 
     codes
+}
+
+fn split_noqa_reason(text: &str) -> (&str, Option<&str>) {
+    for (index, _) in text.match_indices("--") {
+        let before = text[..index].chars().next_back();
+        let after = text[index + 2..].chars().next();
+        let separated_before = before.is_some_and(char::is_whitespace);
+        let separated_after = after.is_none_or(char::is_whitespace);
+        if separated_before && separated_after {
+            return (&text[..index], Some(text[index + 2..].trim()));
+        }
+    }
+    (text, None)
 }
 
 fn noqa_remainder(text: &str) -> Option<&str> {
@@ -545,14 +702,23 @@ fn remove_selector_from_segment(segment: &str, target: &str) -> String {
         if let Some(relative_colon) = segment[noqa_pos..].find(':') {
             let colon = noqa_pos + relative_colon;
             let prefix = &segment[..colon];
-            let kept = parse_csv_codes(&segment[colon + 1..])
+            let (selector_text, reason) = split_noqa_reason(&segment[colon + 1..]);
+            let kept = parse_csv_codes(selector_text)
                 .into_iter()
                 .filter(|item| item != &target)
                 .collect::<Vec<_>>();
             return if kept.is_empty() {
                 String::new()
             } else {
-                format!("{prefix}: {}", kept.join(", "))
+                let mut replacement = format!("{prefix}: {}", kept.join(", "));
+                if let Some(reason) = reason {
+                    replacement.push_str(" --");
+                    if !reason.is_empty() {
+                        replacement.push(' ');
+                        replacement.push_str(reason);
+                    }
+                }
+                replacement
             };
         }
     }
@@ -583,6 +749,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_sk901_noqa_on_multiline_statement_boundary_gets_statement_scope() {
+        for source in [
+            "value = Vector3(  # noqa: SK901 -- vector\n    11,\n    12,\n)\n",
+            "value = Vector3(\n    11,\n    12,\n)  # noqa: SK901 -- vector\n",
+        ] {
+            let state = SuppressionState::parse(source);
+            let suppression = state.suppressions.first().expect("SK901 suppression");
+            assert_eq!(suppression.statement_scope, Some((1, 4)));
+            assert!(!state.suppressing_ids_for(2, "SK901", None).is_empty());
+            assert!(!state.suppressing_ids_for(3, "SK901", None).is_empty());
+            assert!(state.suppressing_ids_for(2, "SK401", None).is_empty());
+        }
+    }
+
+    #[test]
+    fn sk901_noqa_on_middle_continuation_line_stays_line_local() {
+        let state = SuppressionState::parse(
+            "value = Vector3(\n    11,  # noqa: SK901 -- one component\n    12,\n)\n",
+        );
+        let suppression = state.suppressions.first().expect("SK901 suppression");
+        assert_eq!(suppression.statement_scope, None);
+        assert!(!state.suppressing_ids_for(2, "SK901", None).is_empty());
+        assert!(state.suppressing_ids_for(3, "SK901", None).is_empty());
+    }
+
+    #[test]
+    fn compound_statement_header_never_creates_sk901_statement_scope() {
+        let state = SuppressionState::parse(
+            "def check():  # noqa: SK901 -- line only\n    return runtime_call(99)\n",
+        );
+        let suppression = state.suppressions.first().expect("SK901 suppression");
+        assert_eq!(suppression.statement_scope, None);
+        assert!(state.suppressing_ids_for(2, "SK901", None).is_empty());
+    }
+
+    #[test]
     fn remover_handles_space_separated_noqa_selectors() {
         assert_eq!(
             remove_selector_from_segment("# noqa: RUF100 DOC601 DOC603", "DOC601"),
@@ -592,6 +794,33 @@ mod tests {
             remove_selector_from_segment("# noqa: DOC601 DOC603", "DOC601"),
             "# noqa: DOC603"
         );
+    }
+
+    #[test]
+    fn noqa_reason_is_not_parsed_as_selectors() {
+        let state = SuppressionState::parse(
+            "x=1  # noqa: SK507 -- SK999 protocol __getattr__ must raise AttributeError\n",
+        );
+        assert_eq!(state.suppressions.len(), 1);
+        assert_eq!(state.suppressions[0].codes, vec!["SK507"]);
+    }
+
+    #[test]
+    fn unused_noqa_selector_removal_preserves_reason_only_when_selectors_remain() {
+        assert_eq!(
+            remove_selector_from_segment("# noqa: SK507 -- reason", "SK507"),
+            ""
+        );
+        for segment in [
+            "# noqa: SK506, BLE001, S110 -- reason",
+            "# noqa: BLE001, SK506, S110 -- reason",
+            "# noqa: BLE001, S110, SK506 -- reason",
+        ] {
+            assert_eq!(
+                remove_selector_from_segment(segment, "SK506"),
+                "# noqa: BLE001, S110 -- reason"
+            );
+        }
     }
 
     #[test]

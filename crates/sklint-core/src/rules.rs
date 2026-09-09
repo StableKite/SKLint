@@ -169,7 +169,7 @@ pub const ALL_RULES: &[Rule] = &[
         code: "SK505",
         name: "DefinitionOrder",
         level: RuleLevel::Normal,
-        summary: "Definitions should appear before their first use",
+        summary: "Definitions should appear before their first eager use",
     },
     Rule {
         code: "SK509",
@@ -193,7 +193,7 @@ pub const ALL_RULES: &[Rule] = &[
         code: "SK507",
         name: "RaiseHotPath",
         level: RuleLevel::Normal,
-        summary: "raise is restricted to lifecycle methods and their private helpers",
+        summary: "raise is restricted to lifecycle/private helpers except module __getattr__ AttributeError",
     },
     Rule {
         code: "SK508",

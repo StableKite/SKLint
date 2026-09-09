@@ -56,6 +56,14 @@ pub struct PyProjectConfig {
     pub ignore: Vec<String>,
     pub formatter_docstring_style: Option<DocStyle>,
     pub pydoclint_style: Option<DocStyle>,
+    /// Additional assertion/oracle helper names or `*` patterns used by
+    /// SK901. The patterns are matched against both the full qualified call
+    /// name and its final component, so `verify_*` also matches
+    /// `checks.verify_equal(...)`.
+    pub assertion_helpers: Vec<String>,
+    /// Additional function/method names or `*` patterns that define an
+    /// explicit exception boundary for SK506.
+    pub exception_boundary_functions: Vec<String>,
     /// Configuration errors discovered while parsing `[tool.sklint]`.
     /// CLI entry points fail-fast on these instead of silently linting with
     /// a partially applied configuration.
@@ -80,6 +88,8 @@ pub struct EffectiveConfig {
     pub pydoclint_config_path: Option<PathBuf>,
     pub pydoclint_inferred_config_context: Option<PathBuf>,
     pub pydoclint_overrides: PydoclintCliOverrides,
+    pub assertion_helpers: Vec<String>,
+    pub exception_boundary_functions: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -150,6 +160,16 @@ impl EffectiveConfig {
             pydoclint_config_path: vscode.pydoclint_config_path.clone(),
             pydoclint_inferred_config_context: vscode.pydoclint_inferred_config_context.clone(),
             pydoclint_overrides: vscode.pydoclint_overrides.clone(),
+            assertion_helpers: if has_product_pyproject {
+                pyproject.assertion_helpers.clone()
+            } else {
+                Vec::new()
+            },
+            exception_boundary_functions: if has_product_pyproject {
+                pyproject.exception_boundary_functions.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -275,6 +295,22 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
                         .errors
                         .push(format!("[tool.sklint] ignore {message}")),
                 },
+                "assertion_helpers" | "assertion-helpers" => {
+                    match parse_string_array_preserving_case(value) {
+                        Ok(parsed) => config.assertion_helpers = parsed,
+                        Err(message) => config
+                            .errors
+                            .push(format!("[tool.sklint] {key} {message}")),
+                    }
+                }
+                "exception_boundary_functions" | "exception-boundary-functions" => {
+                    match parse_string_array_preserving_case(value) {
+                        Ok(parsed) => config.exception_boundary_functions = parsed,
+                        Err(message) => config
+                            .errors
+                            .push(format!("[tool.sklint] {key} {message}")),
+                    }
+                }
                 "formatter-docstring-style" | "formatter_docstring_style" => {
                     match DocStyle::parse(trim_toml_string(value)) {
                         Some(style) if is_quoted_toml_string(value) => {
@@ -308,6 +344,8 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
     config.pydoclint_style = sklint_pydoclint_style.or(upstream_pydoclint_style);
     normalize_code_list(&mut config.select);
     normalize_code_list(&mut config.ignore);
+    normalize_pattern_list(&mut config.assertion_helpers);
+    normalize_pattern_list(&mut config.exception_boundary_functions);
     validate_selectors("select", &config.select, &mut config.errors);
     validate_selectors("ignore", &config.ignore, &mut config.errors);
     config.errors.sort();
@@ -404,6 +442,14 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 fn parse_string_array_checked(value: &str) -> Result<Vec<String>, String> {
+    parse_string_array(value, true)
+}
+
+fn parse_string_array_preserving_case(value: &str) -> Result<Vec<String>, String> {
+    parse_string_array(value, false)
+}
+
+fn parse_string_array(value: &str, uppercase: bool) -> Result<Vec<String>, String> {
     let value = value.trim();
     let Some(inner) = value
         .strip_prefix('[')
@@ -453,7 +499,11 @@ fn parse_string_array_checked(value: &str) -> Result<Vec<String>, String> {
         if item.is_empty() {
             return Err("must not contain empty selectors".to_string());
         }
-        items.push(item.to_ascii_uppercase());
+        items.push(if uppercase {
+            item.to_ascii_uppercase()
+        } else {
+            item.to_string()
+        });
         index += 1;
         while index < bytes.len() && bytes[index].is_ascii_whitespace() {
             index += 1;
@@ -580,6 +630,45 @@ fn normalize_code_list(list: &mut Vec<String>) {
     list.dedup();
 }
 
+fn normalize_pattern_list(list: &mut Vec<String>) {
+    for pattern in list.iter_mut() {
+        *pattern = pattern.trim().to_string();
+    }
+    list.retain(|pattern| !pattern.is_empty());
+    list.sort();
+    list.dedup();
+}
+
+pub(crate) fn name_matches_pattern(name: &str, pattern: &str) -> bool {
+    if !pattern.contains('*') {
+        return name == pattern;
+    }
+
+    let starts_with_wildcard = pattern.starts_with('*');
+    let ends_with_wildcard = pattern.ends_with('*');
+    let parts = pattern
+        .split('*')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return true;
+    }
+
+    let mut search_from = 0usize;
+    for (index, part) in parts.iter().enumerate() {
+        let Some(relative) = name[search_from..].find(part) else {
+            return false;
+        };
+        let found_at = search_from + relative;
+        if index == 0 && !starts_with_wildcard && found_at != 0 {
+            return false;
+        }
+        search_from = found_at + part.len();
+    }
+
+    ends_with_wildcard || search_from == name.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +709,58 @@ ignore = [
         );
         assert_eq!(parsed.select, vec!["SK901", "SKD301"]);
         assert_eq!(parsed.ignore, vec!["SK001", "SK201"]);
+    }
+
+    #[test]
+    fn pyproject_parses_semantic_helper_patterns_without_uppercasing() {
+        let parsed = parse_pyproject_toml(
+            r#"
+[tool.sklint]
+assertion_helpers = ["verify", "verify_*", "assert_*"]
+exception_boundary_functions = ["close", "shutdown", "_rollback_*"]
+"#,
+        );
+        assert_eq!(
+            parsed.assertion_helpers,
+            vec!["assert_*", "verify", "verify_*"]
+        );
+        assert_eq!(
+            parsed.exception_boundary_functions,
+            vec!["_rollback_*", "close", "shutdown"]
+        );
+        assert!(parsed.errors.is_empty());
+    }
+
+    #[test]
+    fn invalid_semantic_helper_patterns_are_configuration_errors() {
+        let parsed = parse_pyproject_toml(
+            "[tool.sklint]\nassertion_helpers = [123]\nexception_boundary_functions = false\n",
+        );
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("assertion_helpers")));
+        assert!(parsed
+            .errors
+            .iter()
+            .any(|message| message.contains("exception_boundary_functions")));
+    }
+
+    #[test]
+    fn semantic_name_patterns_use_simple_anchored_glob_matching() {
+        assert!(name_matches_pattern("verify_equal", "verify_*"));
+        assert!(name_matches_pattern("assert_called_once_with", "assert_*"));
+        assert!(name_matches_pattern(
+            "_rollback_native_state",
+            "_rollback_*"
+        ));
+        assert!(name_matches_pattern(
+            "prefix_middle_suffix",
+            "prefix_*_suffix"
+        ));
+        assert!(name_matches_pattern("pkg.verify_equal", "*.verify_*"));
+        assert!(!name_matches_pattern("my_verify_equal", "verify_*"));
+        assert!(!name_matches_pattern("verify_equal_extra", "verify_equal"));
     }
 
     #[test]

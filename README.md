@@ -14,7 +14,7 @@ SKLint не заменяет Ruff, Pyright, Pylint, wemake или flake8. Вст
 Его задача — добавлять только те проверки, которые нужны проекту и не закрываются существующими инструментами полностью.  
 Все основные правила, suppressions, автоисправления и форматтер реализованы в Rust-ядре `sklint-core`, а CLI, Python wrapper и VSCode расширение вызывают одно и то же API.
 
-> Linux release note: текущая glibc-сборка публикуется с PEP 600 tag `manylinux_2_39_x86_64`; она требует glibc >= 2.39. Для более старых дистрибутивов нужен отдельный older-baseline/musl build.
+> Linux release note: release-бинарники собираются на Ubuntu 22.04 и проверяются на ceiling `GLIBC_2.35`. Wheel можно маркировать `manylinux_2_35_x86_64` только после такой же проверки symbol ceiling; более новый host сам по себе не даёт права на этот tag.
 
 # Общая информация о проекте
 
@@ -80,6 +80,11 @@ sklint explain SK601
 strict = false
 select = []
 ignore = []
+# Python `assert`, unittest-style assertions and conventional `assert_*` helpers
+# are built-in oracle contexts. Project-specific helpers support `*` wildcards:
+# assertion_helpers = ["verify", "verify_*", "expect_*"]
+# Additional explicit exception-boundary functions for SK506.
+# exception_boundary_functions = ["_rollback_*", "probe_*"]
 # Docstring semantics are first-class SKLint options. Legacy
 # [tool.pydoclint] / [tool.sklint.pydoclint] sections are migration aliases.
 allow_init_docstring = true
@@ -96,6 +101,10 @@ external = ["SK"]
 ```
 
 `external = ["SK"]` нужен, если Ruff используется вместе со SKLint и в коде встречаются suppressions вида `# noqa: SKxxx`.
+
+`SK901` считает непосредственный числовой literal именованного keyword argument самодокументируемым (`timeout=0.2`), но продолжает анализировать числа внутри выражения (`timeout=BASE_TIMEOUT * 2`). Python `assert`, стандартные assertion-методы `unittest`/`unittest.mock`, обычные `assert_*` и helpers из `assertion_helpers` считаются oracle-context; для method-style assertions учитывается terminal callable name независимо от формы receiver (`mock.assert_called_with(...)`, `mocks["x"].assert_called_with(...)`, `factory().assert_called_with(...)` эквивалентны): прямые expected literals, expected-data containers и арифметика, непосредственно описывающая ожидаемое значение, не требуют фиктивных констант. Oracle-context не распространяется сквозь вложенный обычный runtime-вызов: в `verify_equal(result, runtime_call(timeout=123))` аргументы `runtime_call` снова проверяются по обычной call-context policy. Поэтому `sleep(0.2)`, `range(40)`, `retry(5)`, `int(bits, 2)`, `round(value, 3)` и `timeout=BASE_TIMEOUT * 2` внутри runtime calls остаются под SK901. Это намеренная context-sensitive oracle policy, а не test-wide exemption.
+
+`SK506` по-прежнему запрещает `try`/`except` в обычном runtime/hot path, но разрешает явную обработку исключений в lifecycle/cleanup boundaries (`close`, `shutdown`, `cleanup`, `teardown`, `rollback`, `release`, `__exit__`, `__aexit__`) и в приватных helpers, используемых только такими boundaries. Дополнительные project-specific границы задаются через `exception_boundary_functions`. `SK510` при этом не ослабляется: `contextlib.suppress(...)` остаётся запрещённым в strict mode.
 
 ## VSCode
 
@@ -145,6 +154,8 @@ value = build_value()  # pyright: ignore[reportAny]  # noqa: SK401
 ```
 
 В strict-режиме глобальные подавления в прологе файла запрещены правилом `SK805`. Это касается не только SKLint, но и распространённых директив других анализаторов: `# ruff: noqa`, `# flake8: noqa`, `# pylint: disable=...`, `# pyright: report...=false`, `# type: ignore`, `# mypy: ignore-errors` и аналогичных file-wide suppressions. Локальные подавления на конкретных строках кода остаются допустимыми.
+
+Для `SK901` есть узкое statement-scope расширение обычного локального suppression: если явный selector `SK901` стоит на первой или закрывающей строке многострочного simple statement, он подавляет `SK901` diagnostics внутри только этого statement. Это предназначено для намеренных test/data vectors и fixtures. Suppression на средней continuation-строке остаётся line-local, а `def`/`class`/`if`/`for`/`with`/`try`/`match` не становятся function/block scope. Selector считается использованным для `SK900` только если реально подавлен хотя бы один `SK901`.
 
 Для докстрингов `SK6xx` подавление ставится на последней строке докстринга:
 

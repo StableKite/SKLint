@@ -548,7 +548,11 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn input(source: &str) -> AnalysisInput {
         AnalysisInput {
@@ -672,6 +676,133 @@ def f(a, b: int):
         let fix = unused[0].fix.as_ref().expect("safe selective fix");
         assert!(fix.safe);
         assert_eq!(fix.replacement, "x=1  # noqa: E501, SK401");
+    }
+
+    #[test]
+    fn sk900_safe_fix_never_tokenizes_noqa_reason_as_selectors() {
+        let cases = [
+            ("x = 1  # noqa: SK001 -- protocol reason\n", "x = 1"),
+            (
+                "x = 1  # noqa: SK001, BLE001, S110 -- intentional boundary\n",
+                "x = 1  # noqa: BLE001, S110 -- intentional boundary",
+            ),
+            (
+                "x = 1  # noqa: BLE001, SK001, S110 -- intentional boundary\n",
+                "x = 1  # noqa: BLE001, S110 -- intentional boundary",
+            ),
+            (
+                "x = 1  # noqa: BLE001, S110, SK001 -- intentional boundary\n",
+                "x = 1  # noqa: BLE001, S110 -- intentional boundary",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let report = analyze(input(source));
+            let unused = report
+                .diagnostics
+                .iter()
+                .find(|diag| diag.code == "SK900")
+                .expect("SK900");
+            let fix = unused.fix.as_ref().expect("safe fix");
+            assert!(fix.safe);
+            assert_eq!(fix.replacement, expected);
+
+            let second = analyze(input(&format!("{}\n", fix.replacement)));
+            assert!(
+                second.diagnostics.iter().all(|diag| diag.code != "SK900"),
+                "second pass must not leave malformed SKLint suppressions: {}",
+                fix.replacement
+            );
+        }
+    }
+
+    #[test]
+    fn sk901_multiline_statement_scope_suppresses_nested_diagnostics_from_first_line() {
+        let report = analyze(input(
+            "# sklint: strict\nfirst = Vector3(  # noqa: SK901 -- intentional vector\n    11,\n    12,\n    13,\n)\nsecond = runtime_call(99)\n",
+        ));
+        let sk901 = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "SK901")
+            .collect::<Vec<_>>();
+        assert_eq!(sk901.len(), 1);
+        assert_eq!(sk901[0].line, 7, "sibling statement must remain active");
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| { diagnostic.code != "SK900" || diagnostic.line != 2 }));
+    }
+
+    #[test]
+    fn sk901_multiline_statement_scope_accepts_closing_line_and_nested_runtime_call() {
+        let report = analyze(input(
+            "# sklint: strict\nexpected = build_expected(\n    Vector3(11, 12, 13),\n    runtime_call(timeout = 99),\n)  # noqa: SK901 -- intentional complete fixture\n",
+        ));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "SK901"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "SK900"));
+    }
+
+    #[test]
+    fn sk901_statement_scope_covers_multiline_literal_container_fixture() {
+        let report = analyze(input(
+            "# sklint: strict\nfixture = consume(  # noqa: SK901 -- intentional structured fixture\n    [left * 123],\n    {\"x\": right * 456},\n    (top * 789,),\n)\n",
+        ));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "SK901"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "SK900"));
+    }
+
+    #[test]
+    fn sk901_statement_scope_keeps_middle_line_noqa_line_local() {
+        let report = analyze(input(
+            "# sklint: strict\nvalue = Vector3(\n    11,  # noqa: SK901 -- only this component\n    12,\n)\n",
+        ));
+        let sk901 = report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "SK901")
+            .collect::<Vec<_>>();
+        assert_eq!(sk901.len(), 1);
+        assert_eq!(sk901[0].line, 4);
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "SK900"));
+    }
+
+    #[test]
+    fn sk901_statement_scope_reports_unused_and_never_becomes_function_scope() {
+        let unused = analyze(input(
+            "# sklint: strict\nvalue = Vector3(  # noqa: SK901 -- no magic values here\n    0,\n    1,\n)\n",
+        ));
+        assert!(unused
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SK900" && diagnostic.line == 2));
+
+        let compound = analyze(input(
+            "# sklint: strict\ndef check():  # noqa: SK901 -- must stay line-local\n    return runtime_call(99)\n",
+        ));
+        assert!(compound
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SK901" && diagnostic.line == 3));
+        assert!(compound
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SK900" && diagnostic.line == 2));
     }
 
     #[test]
@@ -813,6 +944,40 @@ def f() -> int:
         ));
         assert!(report.diagnostics.iter().any(|diag| diag.code == "SK617"));
         assert!(report.diagnostics.iter().all(|diag| diag.code != "SK900"));
+    }
+
+    #[test]
+    fn configured_assertion_helpers_are_loaded_from_project_pyproject() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-assertion-helper-config-{unique}"));
+        fs::create_dir_all(&root).expect("create temp project");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nselect = [\"SK901\"]\nassertion_helpers = [\"verify\", \"verify_*\"]\n",
+        )
+        .expect("write pyproject");
+        let path = root.join("example.py");
+        let source = "result = 1\nverify_equal(result, 123)\nverify(result == 456)\nordinary(result, 789)\nverify_equal(result, runtime_call(timeout = 123))\n";
+        fs::write(&path, source).expect("write source");
+
+        let report = analyze(AnalysisInput {
+            path,
+            source: source.to_string(),
+            vscode_config: VscodeConfig::default(),
+        });
+        let sk901 = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.code == "SK901")
+            .collect::<Vec<_>>();
+        assert_eq!(sk901.len(), 2);
+        assert_eq!(sk901[0].line, 4);
+        assert_eq!(sk901[1].line, 5);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

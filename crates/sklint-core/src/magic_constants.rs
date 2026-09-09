@@ -9,9 +9,9 @@
 //!
 //! All ownership/context decisions are made from the RustPython AST.
 
-use crate::config::EffectiveConfig;
+use crate::config::{name_matches_pattern, EffectiveConfig};
 use crate::diagnostic::{Diagnostic, Span};
-use crate::python_ast::{qualified_name, source_text, PythonAst};
+use crate::python_ast::{final_name, qualified_name, source_text, PythonAst};
 use rustpython_parser::ast::{self, Constant, Expr, Stmt, UnaryOp};
 use std::collections::HashSet;
 use std::path::Path;
@@ -33,13 +33,20 @@ enum ExprContext {
     /// RHS of an explicitly named constant. Literal-building operations are
     /// self-documenting, but comparison operands inside the RHS remain magic.
     NamedConstantValue,
+    /// Numeric literals inside a recognized assertion/oracle expression are
+    /// expected values, not runtime tuning constants.
+    AssertionOracle,
+    /// Positional call arguments and arithmetic inside call arguments remain
+    /// strict even for WPS small-integer whitelist values. Direct numeric
+    /// keyword literals use `DirectLiteralSafe` instead.
+    CallArgument,
 }
 
 fn nested_expr_context(parent: ExprContext, default: ExprContext) -> ExprContext {
-    if parent == ExprContext::NamedConstantValue {
-        ExprContext::NamedConstantValue
-    } else {
-        default
+    match parent {
+        ExprContext::NamedConstantValue => ExprContext::NamedConstantValue,
+        ExprContext::AssertionOracle => ExprContext::AssertionOracle,
+        _ => default,
     }
 }
 
@@ -47,6 +54,7 @@ struct Visitor<'a> {
     path: String,
     source: &'a str,
     ast: &'a PythonAst,
+    config: &'a EffectiveConfig,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -68,6 +76,7 @@ pub fn run_magic_constant_rule(
         path: display_path,
         source,
         ast: &ast,
+        config,
         diagnostics: Vec::new(),
     };
     let scope = scope_for_body(&Scope::default(), &ast.suite, &[]);
@@ -311,9 +320,9 @@ impl Visitor<'_> {
                     self.visit_statements(&node.finalbody, scope, false);
                 }
                 Stmt::Assert(node) => {
-                    self.visit_expr(&node.test, scope, ExprContext::Normal);
+                    self.visit_expr(&node.test, scope, ExprContext::AssertionOracle);
                     if let Some(msg) = &node.msg {
-                        self.visit_expr(msg, scope, ExprContext::Normal);
+                        self.visit_expr(msg, scope, ExprContext::AssertionOracle);
                     }
                 }
                 Stmt::Expr(node) => self.visit_expr(&node.value, scope, ExprContext::Normal),
@@ -344,7 +353,14 @@ impl Visitor<'_> {
             match context {
                 ExprContext::DirectLiteralSafe
                 | ExprContext::ComparisonOperand
-                | ExprContext::NamedConstantValue => return,
+                | ExprContext::NamedConstantValue
+                | ExprContext::AssertionOracle => return,
+                ExprContext::CallArgument => {
+                    if !call_argument_number_allowed(&text) {
+                        self.report(expr, &text);
+                    }
+                    return;
+                }
                 ExprContext::Normal => {
                     if !wps_number_allowed(&text) {
                         self.report(expr, &text);
@@ -377,22 +393,22 @@ impl Visitor<'_> {
                 );
             }
             Expr::BinOp(node) => {
-                self.visit_expr(
-                    &node.left,
-                    scope,
-                    nested_expr_context(context, ExprContext::Normal),
-                );
-                self.visit_expr(
-                    &node.right,
-                    scope,
-                    nested_expr_context(context, ExprContext::Normal),
-                );
+                let operand_context = if context == ExprContext::CallArgument {
+                    ExprContext::CallArgument
+                } else {
+                    nested_expr_context(context, ExprContext::Normal)
+                };
+                self.visit_expr(&node.left, scope, operand_context);
+                self.visit_expr(&node.right, scope, operand_context);
             }
-            Expr::UnaryOp(node) => self.visit_expr(
-                &node.operand,
-                scope,
-                nested_expr_context(context, ExprContext::Normal),
-            ),
+            Expr::UnaryOp(node) => {
+                let operand_context = if context == ExprContext::CallArgument {
+                    ExprContext::CallArgument
+                } else {
+                    nested_expr_context(context, ExprContext::Normal)
+                };
+                self.visit_expr(&node.operand, scope, operand_context);
+            }
             Expr::Lambda(node) => {
                 for arg in &node.args.posonlyargs {
                     if let Some(default) = &arg.default {
@@ -543,26 +559,59 @@ impl Visitor<'_> {
                 scope,
                 nested_expr_context(context, ExprContext::Normal),
             ),
-            Expr::Compare(node) => self.visit_comparison(&node.left, &node.comparators, scope),
+            Expr::Compare(node) => {
+                if context == ExprContext::AssertionOracle {
+                    self.visit_expr(&node.left, scope, ExprContext::AssertionOracle);
+                    for comparator in &node.comparators {
+                        self.visit_expr(comparator, scope, ExprContext::AssertionOracle);
+                    }
+                } else {
+                    self.visit_comparison(&node.left, &node.comparators, scope);
+                }
+            }
             Expr::Call(node) => {
-                self.visit_expr(
-                    &node.func,
-                    scope,
-                    nested_expr_context(context, ExprContext::Normal),
-                );
+                // Assertion/oracle context is intentionally not inherited through
+                // an ordinary nested runtime call. The outer oracle may describe
+                // expected data/expressions, but control/tuning values passed to a
+                // nested call keep strict call-argument semantics. A call that is
+                // itself a recognized assertion helper starts a fresh oracle
+                // context for its direct arguments. Named-constant context still
+                // dominates, preserving the existing self-documenting constant
+                // expression policy.
+                let function_context = if context == ExprContext::AssertionOracle {
+                    ExprContext::Normal
+                } else {
+                    nested_expr_context(context, ExprContext::Normal)
+                };
+                self.visit_expr(&node.func, scope, function_context);
+
+                let oracle_call = is_assertion_helper(&node.func, &self.config.assertion_helpers);
                 for arg in &node.args {
-                    self.visit_expr(
-                        arg,
-                        scope,
-                        nested_expr_context(context, ExprContext::Normal),
-                    );
+                    let argument_context = if context == ExprContext::NamedConstantValue {
+                        ExprContext::NamedConstantValue
+                    } else if oracle_call {
+                        ExprContext::AssertionOracle
+                    } else {
+                        ExprContext::CallArgument
+                    };
+                    self.visit_expr(arg, scope, argument_context);
                 }
                 for keyword in &node.keywords {
-                    self.visit_expr(
-                        &keyword.value,
-                        scope,
-                        nested_expr_context(context, ExprContext::Normal),
-                    );
+                    let keyword_context = if context == ExprContext::NamedConstantValue {
+                        ExprContext::NamedConstantValue
+                    } else if oracle_call {
+                        ExprContext::AssertionOracle
+                    } else if context == ExprContext::AssertionOracle {
+                        // A runtime call nested in an oracle expression is a real
+                        // computation boundary: even a direct keyword literal is a
+                        // control/tuning value here, not expected-data syntax.
+                        ExprContext::CallArgument
+                    } else if numeric_literal_text(self.source, &keyword.value).is_some() {
+                        ExprContext::DirectLiteralSafe
+                    } else {
+                        ExprContext::CallArgument
+                    };
+                    self.visit_expr(&keyword.value, scope, keyword_context);
                 }
             }
             Expr::FormattedValue(node) => {
@@ -693,6 +742,37 @@ impl Visitor<'_> {
             "warning",
         ));
     }
+}
+
+fn is_assertion_helper(func: &Expr, configured_patterns: &[String]) -> bool {
+    // Assertion semantics belong to the terminal callable, not to the shape of
+    // the receiver. `qualified_name` intentionally cannot resolve receivers
+    // such as `mocks["set_value"]`, while `final_name` can still recover the
+    // terminal `assert_called_with` attribute from any `Attribute` expression.
+    let Some(leaf) = final_name(func) else {
+        return false;
+    };
+    let qualified = qualified_name(func);
+
+    // Assertion-style naming is itself semantic here. Keep Python/unittest
+    // conventions built in and recognize the conventional snake_case
+    // `assert_*` family. Project-specific conventions such as `verify` /
+    // `verify_*` stay configurable so production APIs named `verify` do not
+    // silently become oracle contexts.
+    let builtin = leaf
+        .strip_prefix("assert_")
+        .is_some_and(|suffix| !suffix.is_empty())
+        || leaf
+            .strip_prefix("assert")
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(|first| first.is_ascii_uppercase());
+    builtin
+        || configured_patterns.iter().any(|pattern| {
+            name_matches_pattern(leaf, pattern)
+                || qualified
+                    .as_deref()
+                    .is_some_and(|name| name_matches_pattern(name, pattern))
+        })
 }
 
 fn is_exact_main_guard(expr: &Expr) -> bool {
@@ -838,6 +918,22 @@ fn wps_number_allowed(text: &str) -> bool {
         return true;
     }
 
+    wps_magic_number_whitelisted(number)
+}
+
+fn call_argument_number_allowed(text: &str) -> bool {
+    let Some(number) = wps_numeric_literal(text) else {
+        return true;
+    };
+
+    // Positional/runtime call arguments do not inherit WPS's broad `integer
+    // <= 10` convenience exception: values such as retry(5) and coefficients
+    // such as BASE_TIMEOUT * 2 are tuning/control values and remain SK901.
+    // Keep only WPS's explicit universal/common-value whitelist.
+    wps_magic_number_whitelisted(number)
+}
+
+fn wps_magic_number_whitelisted(number: WpsNumericLiteral) -> bool {
     // `MAGIC_NUMBERS_WHITELIST` in current WPS. Python numeric equality makes
     // the real-valued entries work across int/float spellings (e.g. 100.0),
     // while the complex whitelist contains only 1j (and 0j equals numeric 0).
@@ -1073,6 +1169,21 @@ mod tests {
         run_magic_constant_rule(Path::new("example.py"), source, &strict_config())
     }
 
+    fn diagnostics_with_assertion_helpers(source: &str, helpers: &[&str]) -> Vec<Diagnostic> {
+        let config = EffectiveConfig::resolve(
+            &VscodeConfig::default(),
+            &PyProjectConfig {
+                has_sklint_section: true,
+                strict: Some(true),
+                select: vec!["SK901".into()],
+                assertion_helpers: helpers.iter().map(|helper| (*helper).to_string()).collect(),
+                ..PyProjectConfig::default()
+            },
+            &FileInlineConfig::default(),
+        );
+        run_magic_constant_rule(Path::new("example.py"), source, &config)
+    }
+
     #[test]
     fn direct_assignment_defaults_containers_and_literal_are_allowed() {
         let source = r#"from typing import Literal
@@ -1115,6 +1226,161 @@ def f(value=999):
         let found = diagnostics("result = value * 999\n");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].code, "SK901");
+    }
+
+    #[test]
+    fn direct_numeric_keyword_arguments_are_self_documenting_only_at_the_literal() {
+        for source in [
+            "func(timeout = 0.2)\n",
+            "func(retry_count = 3)\n",
+            "func(limit = -5)\n",
+        ] {
+            assert!(diagnostics(source).is_empty(), "must allow: {source}");
+        }
+
+        assert_eq!(diagnostics("func(0.2)\n").len(), 1);
+        assert_eq!(diagnostics("func(BASE_TIMEOUT * 2)\n").len(), 1);
+        let found = diagnostics("func(timeout = BASE_TIMEOUT * 2)\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "SK901");
+    }
+
+    #[test]
+    fn assert_statement_is_an_oracle_context_but_runtime_calls_are_not() {
+        assert!(diagnostics("assert result == 123\n").is_empty());
+        assert!(diagnostics("assert 0.0 <= value <= 100.0\n").is_empty());
+
+        for source in [
+            "sleep(0.2)\n",
+            "range(40)\n",
+            "allocate(4096)\n",
+            "retry(5)\n",
+        ] {
+            assert_eq!(
+                diagnostics(source).len(),
+                1,
+                "runtime/control literal must remain SK901: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_arguments_keep_only_the_explicit_common_value_whitelist() {
+        for source in [
+            "func(0)\n",
+            "func(1)\n",
+            "func(0.1)\n",
+            "func(0.5)\n",
+            "func(24)\n",
+        ] {
+            assert!(
+                diagnostics(source).is_empty(),
+                "must keep common value: {source}"
+            );
+        }
+        for source in ["func(2)\n", "func(5)\n", "func(10)\n"] {
+            assert_eq!(
+                diagnostics(source).len(),
+                1,
+                "must analyze call value: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_positional_call_policy_is_intentional_for_common_small_values() {
+        for source in [
+            "int(bits, 2)\n",
+            "chr(10)\n",
+            "int(width / 2)\n",
+            "round(value, 3)\n",
+            "unpack_from(\"<H\", packet, 2)\n",
+        ] {
+            assert_eq!(
+                diagnostics(source).len(),
+                1,
+                "positional/runtime call literal remains SK901 by design: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn conventional_assertion_helpers_are_oracle_contexts() {
+        for source in [
+            "mock.assert_called_once_with(123)\n",
+            "mock.assert_called_with(123)\n",
+            "self.assertEqual(result, 123)\n",
+            "assert_allclose(vector, (1.5, 2.5, 3.5))\n",
+            "assert_array_equal(actual, (2, 3, 4))\n",
+        ] {
+            assert!(diagnostics(source).is_empty(), "must allow: {source}");
+        }
+    }
+
+    #[test]
+    fn assertion_methods_ignore_receiver_shape_but_keep_nested_calls_strict() {
+        for source in [
+            "mock.assert_called_with(123)\n",
+            "mocks[\"set_value\"].assert_called_with(123)\n",
+            "(mocks[\"set_value\"]).assert_called_once_with(456)\n",
+            "factory().assert_called_with(789)\n",
+        ] {
+            assert!(
+                diagnostics_with_assertion_helpers(source, &["verify", "verify_*", "assert_*"])
+                    .is_empty(),
+                "assertion terminal name must be receiver-shape independent: {source}"
+            );
+        }
+
+        let nested = diagnostics_with_assertion_helpers(
+            "mocks[\"x\"].assert_called_with(runtime_call(timeout = 123))\n",
+            &["verify", "verify_*", "assert_*"],
+        );
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].code, "SK901");
+    }
+
+    #[test]
+    fn assertion_oracle_context_stops_at_nested_runtime_calls() {
+        for source in [
+            "verify_equal(result, runtime_call(timeout = 123))\n",
+            "verify_equal(result, runtime_call(timeout = BASE_TIMEOUT * 2))\n",
+            "assert result == runtime_call(timeout = 123)\n",
+        ] {
+            let found = diagnostics_with_assertion_helpers(source, &["verify", "verify_*"]);
+            assert_eq!(
+                found.len(),
+                1,
+                "nested runtime call must restore SK901 call semantics: {source}"
+            );
+            assert_eq!(found[0].code, "SK901");
+        }
+
+        for source in [
+            "verify_equal(result, 123)\n",
+            "verify_equal(result, (1.5, 2.5))\n",
+            "verify_equal(result, factor * 123)\n",
+            "assert result == 123\n",
+            "assert result == factor * 123\n",
+        ] {
+            assert!(
+                diagnostics_with_assertion_helpers(source, &["verify", "verify_*"]).is_empty(),
+                "direct oracle expression must remain allowed: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_assertion_helper_patterns_define_additional_oracle_contexts() {
+        let source = "verify_equal(result, 123)\nverify(0.0 <= value <= 100.0)\nchecks.verify_in(5, values)\nproject_check(result, 456)\n";
+        assert!(diagnostics_with_assertion_helpers(
+            source,
+            &["verify", "verify_*", "project_check"]
+        )
+        .is_empty());
+
+        let without_config = diagnostics("verify_equal(result, 123)\n");
+        assert_eq!(without_config.len(), 1);
     }
 
     #[test]
@@ -1163,8 +1429,8 @@ def f(value=999):
     }
 
     #[test]
-    fn wps_keyword_arguments_are_checked_but_direct_walrus_values_are_allowed() {
-        assert_eq!(diagnostics("print(end=999)\n").len(), 1);
+    fn direct_keyword_arguments_and_direct_walrus_values_are_self_documenting() {
+        assert!(diagnostics("print(end=999)\n").is_empty());
         assert!(diagnostics("if (value := 999):\n    pass\n").is_empty());
         assert_eq!(
             diagnostics("if (value := other * 999):\n    pass\n").len(),

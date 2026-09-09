@@ -392,6 +392,8 @@ class Common(BaseConcConfig):
 
 Сообщает о подавлениях SKLint, которые больше не подавляют актуальные предупреждения. Использование считается отдельно для каждого selector-а; при перекрытии broad/exact suppressions ответственность получает наиболее локальное и специфичное подавление. Formatter удаляет только лишний SKLint selector/segment и сохраняет соседние Ruff/Flake8-коды и обычные комментарии. Поддерживаются `noqa`, `sklint: ignore/disable`, catch-all suppressions, `enable`, prefix selectors и алиасы `DOCxxx ↔ SKDxxx`. Bare `# noqa` без явного SKLint selector-а не считается подавлением SKLint.
 
+Для `SK901` explicit local selector на первой или закрывающей строке многострочного simple statement может владеть всеми `SK901` diagnostics внутри этого statement. Selector становится used только после реального подавления; иначе SK900 сохраняется. Средние continuation-строки остаются line-local, а compound statements не превращают такой comment в function/block-wide suppression.
+
 ## SK401 — AssignmentOperatorSpacing
 
 **Уровень:** обычный.  
@@ -444,13 +446,13 @@ Autofix: отсутствует — замена требует согласов
 
 `from sys import platform` запрещён для проверок платформы. Pylance/Pyright лучше понимает ветвления в форме `import sys` + `if sys.platform ...`.
 
-Autofix: переписывает импорт и условия `if platform ...` / `elif platform ...`.
+Autofix: условный и fail-closed. Он переписывает `from sys import platform` в `import sys` только когда все обнаруженные обращения к импортированному имени находятся в поддерживаемых простых `if platform ...` / `elif platform ...` guards. Если binding также используется в decorator expression, default/kwdefault, annotation, comprehension, lambda, class base/keyword, match guard, module-level expression, shadowed scope или любом другом неоднозначном месте, safe fix не предлагается и formatter оставляет исходный import/binding без изменения. Смешанное состояние `import sys` + оставшийся unqualified `platform` недопустимо.
 
 ## SK505 — DefinitionOrder
 
 **Уровень:** обычный.  
 
-Функции, классы и методы должны быть объявлены выше мест, где они используются. Порядок специальных методов `__new__` / `__init__` / `__post_init__` проверяется отдельным правилом `SK509`.
+Функции и классы должны быть объявлены выше первого **eager** использования во время module/class definition phase. Обычные global-name lookup внутри тела функции/метода/async-функции являются deferred и не требуют перестановки определения, если lookup произойдёт при последующем вызове. Defaults, decorators, class bases/keywords и module/class executable expressions остаются eager. Порядок методов текущего класса проверяется отдельно в рамках SK505, а порядок `__new__` / `__init__` / `__post_init__` — правилом `SK509`.
 
 Autofix: поддерживается встроенным форматировщиком. Форматировщик переставляет цельные блоки `def`/`class` с декораторами выше первого использования, если границы блока можно определить безопасно.
 
@@ -466,7 +468,11 @@ Autofix: поддерживается встроенным форматиров�
 
 **Уровень:** обычный.  
 
-`try`, `except` и `finally` запрещены в hot runtime-коде проекта, так как такая структура часто уводит управление в исключительный путь и усложняет оптимизацию.
+`try`, `except` и `finally` запрещены в обычном hot runtime-коде проекта, так как такая структура часто уводит управление в исключительный путь и усложняет оптимизацию.
+
+Явная обработка исключений разрешена в lifecycle/cleanup boundaries: `close`, `shutdown`, `cleanup`, `teardown`, `rollback`, `release`, `__exit__`, `__aexit__`, а также в приватных helper-функциях/методах, которые используются только распознанными boundaries. Project-specific boundary names можно добавить через `[tool.sklint].exception_boundary_functions`; поддерживается `*`-pattern matching. Если приватный helper также используется обычным runtime-методом, SK506 остаётся активным.
+
+Это исключение намеренно не распространяется на `SK510`: `contextlib.suppress(...)` остаётся запрещённым в strict mode, чтобы exceptional control flow был записан явно.
 
 Autofix: отсутствует.
 
@@ -481,7 +487,7 @@ Autofix: отсутствует.
 
 **Уровень:** обычный.  
 
-`raise` разрешён только в методах `__init__`, `__post_init__`, `run`, `close`, а также в приватных helper-методах, которые используются только этими методами текущего класса.
+`raise` разрешён только в методах `__init__`, `__post_init__`, `run`, `close`, а также в приватных helper-методах, которые используются только этими методами текущего класса. Узкое language-protocol исключение: module-level функция с точным именем `__getattr__` может явно `raise AttributeError(...)`, как требует PEP 562. Другие exception-типы в module `__getattr__` и `AttributeError` в обычных функциях по-прежнему проверяются SK507.
 
 Autofix: отсутствует.
 
@@ -796,6 +802,12 @@ Inline-документация class attribute запрещена, когда c
 ## SK901 — MagicNumericConstant
 
 Числа внутри выражения, присваиваемого явно именованной константе (`UPPER_CASE` или аннотация `Final`), считаются самодокументируемым контекстом и не требуют дополнительного `SK901`-подавления.
+
+Непосредственный numeric/signed-numeric literal именованного keyword argument тоже считается самодокументируемым: `connect(timeout=0.2)` проходит без SK901. Исключение относится только к самому direct literal: в `connect(timeout=BASE_TIMEOUT * 2)` коэффициент `2` продолжает анализироваться, как и positional `connect(0.2)`.
+
+Expected literals внутри Python `assert`, стандартных assertion-методов `unittest`/`unittest.mock` и project-configured assertion helpers считаются test oracle, а не runtime magic values. Дополнительные helper names/patterns задаются через `[tool.sklint].assertion_helpers`, например `['verify', 'verify_*', 'assert_*']`; `*` поддерживается и для qualified calls. Для method-style assertion terminal callable (`assert_called_with`, `assert_called_once_with` и т.п.) распознаётся независимо от формы receiver: обычный `Name`, `Attribute`, `Subscript`, `Call` и parenthesized receiver имеют одинаковую oracle-семантику. Oracle-expression policy разрешает direct expected literals, expected-data containers и арифметику, непосредственно описывающую ожидаемое значение, но прекращает oracle-exemption при входе в обычный вложенный runtime `Call`: его positional/keyword arguments снова анализируются как control/tuning call context. Это не отключает SK901 по пути `tests/**`.
+
+Для намеренных многострочных test/data vectors явный `# noqa: SK901` (или эквивалентный local `sklint: ignore SK901`) на первой либо закрывающей строке многострочного simple statement действует на `SK901` внутри только этого statement. На средней continuation-строке suppression остаётся line-local; compound statement headers не расширяют scope на тело.
 
 **Уровень:** strict-only.  \n**Autofix:** нет.
 

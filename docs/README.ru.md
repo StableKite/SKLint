@@ -32,7 +32,7 @@ SKLint намеренно не должен заменять Ruff, Pyright, Pyli
 Для редких future-grammar gaps внешний CPython используется только как изолированный syntax oracle (`-I -S`) с жёстким timeout; конкретный interpreter можно закрепить через `SKLINT_PYTHON`.
 Если правило уже полностью покрыто внешним инструментом, оно не добавляется в SKLint. В SKLint остаются только проектные требования, дополнительные проверки и те случаи, которые существующие инструменты не закрывают полностью.
 
-> Linux release note: текущая glibc-сборка публикуется с PEP 600 tag `manylinux_2_39_x86_64`; она требует glibc >= 2.39. Для более старых дистрибутивов нужен отдельный older-baseline/musl build.
+> Linux release note: release-бинарники собираются на Ubuntu 22.04 и проверяются на ceiling `GLIBC_2.35`. Wheel можно маркировать `manylinux_2_35_x86_64` только после такой же проверки symbol ceiling; более новый host сам по себе не даёт права на этот tag.
 
 # Общая информация о проекте
 
@@ -189,10 +189,18 @@ sklint explain SK601
 strict = false
 select = []
 ignore = []
+# Дополнительные assertion/oracle helpers для SK901; поддерживается `*`.
+# assertion_helpers = ["verify", "verify_*", "assert_*"]
+# Дополнительные lifecycle/exception boundaries для SK506.
+# exception_boundary_functions = ["_rollback_*", "probe_*"]
 ```
 
 Настройка `strict = true` включает дополнительную группу strict-only правил.  
 `select` и `ignore` работают по префиксам, в стиле Ruff: можно выбрать `SK6`, `SK601` или отключить конкретный код.
+
+Для `SK901` direct numeric keyword literal считается самодокументируемым (`timeout=0.2`), но вложенные коэффициенты продолжают анализироваться (`timeout=BASE_TIMEOUT * 2`). Python `assert`, стандартные assertion-методы `unittest`/`unittest.mock` и вызовы, совпавшие с `assertion_helpers`, образуют oracle-context; для method-style assertions terminal name распознаётся независимо от формы receiver (`mock`, subscript/registry, chained call и т.п.) для прямых expected literals, literal/container expected data и арифметики, непосредственно описывающей ожидаемое значение. Oracle-context не наследуется обычным вложенным runtime `Call`: например, `verify_equal(result, runtime_call(timeout=123))` снова проверяет `123` по стандартной call-context policy. Это не path-based исключение для `tests/**` и не скрывает control/tuning values.
+
+`SK506` разрешает явный `try`/`except` в распознанных lifecycle/cleanup boundaries и в приватных helpers, используемых только ими. Встроенные boundary-имена: `close`, `shutdown`, `cleanup`, `teardown`, `rollback`, `release`, `__exit__`, `__aexit__`; дополнительные patterns задаются `exception_boundary_functions`. `SK510` продолжает запрещать `contextlib.suppress(...)` в strict mode.
 
 ## Совместимость с Ruff
 
@@ -283,6 +291,8 @@ value = build_value()  # pyright: ignore[reportAny]  # noqa: SK401
 ```
 
 В strict-режиме глобальные подавления в прологе файла запрещены правилом `SK805`. Это касается не только SKLint, но и распространённых директив других анализаторов: `# ruff: noqa`, `# flake8: noqa`, `# pylint: disable=...`, `# pyright: report...=false`, `# type: ignore`, `# mypy: ignore-errors` и аналогичных file-wide suppressions. Локальные подавления на конкретных строках кода остаются допустимыми.
+
+Для `SK901` локальный explicit selector на первой или закрывающей строке многострочного simple statement имеет statement scope: он подавляет `SK901` только внутри этого одного statement. Это позволяет один раз документировать намеренный multiline vector/fixture. Suppression на средней continuation-строке остаётся обычным line-local suppression; compound statements (`def`, `class`, `if`, `for`, `with`, `try`, `match`) не расширяют suppression на тело. `SK900` считает selector использованным только после фактического подавления хотя бы одного вложенного `SK901`.
 
 Для блока:
 
