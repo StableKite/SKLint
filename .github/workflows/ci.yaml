@@ -1,0 +1,611 @@
+name: Build and publish SKLint to devpi
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_VERSION: "0.1.50"
+  PYTHON_JIT: "1"
+  RUST_TOOLCHAIN: "1.98.0"
+  EXPECTED_RUSTC: "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  DEVPI_SERVER: "https://stablekite.com:4438/"
+  DEVPI_TARGET_INDEX: "https://stablekite.com:4438/StableKite/index/"
+
+jobs:
+  windows_x86_64:
+    name: Windows x86_64 / native wheel and canonical sdist validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up CI Python
+        uses: ./.github/actions/setup-ci-python
+      - name: Verify package versions
+        shell: pwsh
+        run: python .github/scripts/ci_sklint.py verify-versions
+      - name: Install exact Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set profile minimal
+          rustup toolchain install $env:RUST_TOOLCHAIN --component rustfmt --component clippy
+          rustup default $env:RUST_TOOLCHAIN
+          $actual = (rustc --version).Trim()
+          Write-Host $actual
+          if ($actual -ne $env:EXPECTED_RUSTC) { throw "Unexpected rustc: $actual" }
+      - name: Prepare provenance environment
+        shell: pwsh
+        run: |
+          $sha = (python .github/scripts/ci_sklint.py source-manifest --output "$env:RUNNER_TEMP\SOURCE_MANIFEST.txt").Trim()
+          "SKLINT_SOURCE_TREE_SHA256=$sha" >> $env:GITHUB_ENV
+          "SKLINT_SOURCE_COMMIT=$env:GITHUB_SHA" >> $env:GITHUB_ENV
+          "SKLINT_SOURCE_DIRTY=false" >> $env:GITHUB_ENV
+          "SKLINT_BUILD_VERSION=$env:PACKAGE_VERSION" >> $env:GITHUB_ENV
+          "SKLINT_BUILD_REVISION=v$env:PACKAGE_VERSION" >> $env:GITHUB_ENV
+          "SKLINT_CARGO_PROFILE=release" >> $env:GITHUB_ENV
+          "SKLINT_WHEEL_PLATFORM_TAG=win_amd64" >> $env:GITHUB_ENV
+      - name: Audits and locked Rust gates
+        shell: pwsh
+        run: |
+          python scripts/audit-rule-docs.py
+          python scripts/audit-fix-coverage.py
+          python scripts/audit-pydoclint-port.py
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --release --locked -p sklint
+      - name: Build Windows wheel and canonical sdist
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build wheel twine
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          python -m build --wheel --sdist --outdir dist
+          python .github/scripts/ci_sklint.py verify-dist --dir dist --platform-tag win_amd64 --expect-sdist
+          python -m twine check dist/*
+      - name: Verify Windows provenance
+        shell: pwsh
+        run: python .github/scripts/ci_sklint.py verify-provenance --binary target/release/sklint.exe --target x86_64-pc-windows-msvc
+      - name: Installed-package smoke
+        shell: pwsh
+        run: |
+          if (Test-Path verify-venv) { Remove-Item verify-venv -Recurse -Force }
+          python -m venv verify-venv
+          .\verify-venv\Scripts\python.exe .github/scripts/ci_python_policy.py --verify
+          $wheel = Get-ChildItem dist -Filter "sklint-$env:PACKAGE_VERSION-py3-none-win_amd64.whl"
+          if (@($wheel).Count -ne 1) { throw "Unexpected Windows wheel set" }
+          .\verify-venv\Scripts\python.exe -m pip install --no-index --no-deps $wheel[0].FullName
+          .\verify-venv\Scripts\python.exe .github/scripts/ci_sklint.py smoke
+      - name: Build and smoke Windows VSIX
+        shell: pwsh
+        run: |
+          Push-Location vscode
+          npm ci
+          npm run compile
+          Pop-Location
+          python scripts/package-vscode.py
+          $vsix = "dist/sklint-$env:PACKAGE_VERSION.vsix"
+          if (-not (Test-Path $vsix)) { throw "VSIX was not produced: $vsix" }
+          $extract = Join-Path $env:RUNNER_TEMP "vsix-win"
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          python -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" $vsix $extract
+          python .github/scripts/ci_sklint.py verify-provenance --binary "$extract/extension/bin/win32-x64/sklint.exe" --target x86_64-pc-windows-msvc
+          if (git status --porcelain) { throw "Tracked files changed during Windows validation" }
+      - name: Upload Windows distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-dist-windows-x86_64
+          if-no-files-found: error
+          path: |
+            dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-win_amd64.whl
+            dist/sklint-${{ env.PACKAGE_VERSION }}.tar.gz
+      - name: Upload Windows VSIX
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-vsix-windows-x86_64
+          if-no-files-found: error
+          path: dist/sklint-${{ env.PACKAGE_VERSION }}.vsix
+
+  glibc_x86_64:
+    name: Linux glibc x86_64 / native wheel and full release validation
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up CI Python
+        uses: ./.github/actions/setup-ci-python
+      - name: Verify package versions
+        run: python .github/scripts/ci_sklint.py verify-versions
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install "$RUST_TOOLCHAIN" --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version)" = "$EXPECTED_RUSTC"
+      - name: Prepare provenance environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(python .github/scripts/ci_sklint.py source-manifest --output "$RUNNER_TEMP/SOURCE_MANIFEST.txt")"
+          {
+            echo "SKLINT_SOURCE_TREE_SHA256=$sha"
+            echo "SKLINT_SOURCE_COMMIT=$GITHUB_SHA"
+            echo "SKLINT_SOURCE_DIRTY=false"
+            echo "SKLINT_BUILD_VERSION=$PACKAGE_VERSION"
+            echo "SKLINT_BUILD_REVISION=v$PACKAGE_VERSION"
+            echo "SKLINT_CARGO_PROFILE=release"
+            echo "SKLINT_WHEEL_PLATFORM_TAG=manylinux_2_35_x86_64"
+          } >> "$GITHUB_ENV"
+      - name: Locked Rust gates and complete release checks
+        shell: bash
+        env:
+          PYTHON: python
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --release --locked -p sklint
+          bash scripts/check-release.sh
+      - name: Preserve and verify Linux x86_64 VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          vsix="dist/sklint-${PACKAGE_VERSION}.vsix"
+          test -f "$vsix"
+          cp "$vsix" "$RUNNER_TEMP/sklint-${PACKAGE_VERSION}-linux-x86_64.vsix"
+          rm -rf "$RUNNER_TEMP/vsix-linux"
+          python - "$vsix" "$RUNNER_TEMP/vsix-linux" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          vsix, destination = sys.argv[1:]
+          member = "extension/bin/linux-x64/sklint"
+          with zipfile.ZipFile(vsix) as archive:
+              info = archive.getinfo(member)
+              mode = (info.external_attr >> 16) & 0o777
+              if not mode & 0o111:
+                  raise SystemExit(f"VSIX binary is not executable in archive metadata: mode={mode:o}")
+              archive.extractall(destination)
+          binary = os.path.join(destination, member)
+          os.chmod(binary, os.stat(binary).st_mode | 0o111)
+          PY
+          python .github/scripts/ci_sklint.py verify-provenance --binary "$RUNNER_TEMP/vsix-linux/extension/bin/linux-x64/sklint" --target x86_64-unknown-linux-gnu
+          test -z "$(git status --porcelain)"
+      - name: Build glibc x86_64 wheel and enforce GLIBC ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binutils
+          python -m pip install --upgrade pip build wheel twine
+          rm -rf dist
+          python -m build --wheel --outdir dist
+          python .github/scripts/ci_sklint.py verify-dist --dir dist --platform-tag manylinux_2_35_x86_64
+          python -m twine check dist/*
+          bin=target/release/sklint
+          test -x "$bin"
+          max_glibc="$(readelf --version-info "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | tail -n1 || true)"
+          test -n "$max_glibc"
+          number="${max_glibc#GLIBC_}"
+          test "$(printf '%s\n%s\n' "$number" '2.35' | sort -V | head -n1)" = "$number"
+          echo "max_glibc=$max_glibc"
+          python .github/scripts/ci_sklint.py verify-provenance --binary "$bin" --target x86_64-unknown-linux-gnu
+      - name: Installed-package smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf verify-venv
+          python -m venv verify-venv
+          verify-venv/bin/python .github/scripts/ci_python_policy.py --verify
+          verify-venv/bin/python -m pip install --no-index --no-deps "dist/sklint-${PACKAGE_VERSION}-py3-none-manylinux_2_35_x86_64.whl"
+          verify-venv/bin/python .github/scripts/ci_sklint.py smoke
+          test -z "$(git status --porcelain)"
+      - name: Upload glibc x86_64 wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-dist-glibc-x86_64
+          if-no-files-found: error
+          path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-manylinux_2_35_x86_64.whl
+      - name: Upload Linux x86_64 VSIX
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-vsix-linux-x86_64
+          if-no-files-found: error
+          path: ${{ runner.temp }}/sklint-${{ env.PACKAGE_VERSION }}-linux-x86_64.vsix
+
+  glibc_aarch64:
+    name: Linux glibc aarch64 / native wheel validation
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up CI Python
+        uses: ./.github/actions/setup-ci-python
+      - name: Verify package versions
+        run: python .github/scripts/ci_sklint.py verify-versions
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install "$RUST_TOOLCHAIN" --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version)" = "$EXPECTED_RUSTC"
+      - name: Prepare provenance environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(python .github/scripts/ci_sklint.py source-manifest --output "$RUNNER_TEMP/SOURCE_MANIFEST.txt")"
+          {
+            echo "SKLINT_SOURCE_TREE_SHA256=$sha"
+            echo "SKLINT_SOURCE_COMMIT=$GITHUB_SHA"
+            echo "SKLINT_SOURCE_DIRTY=false"
+            echo "SKLINT_BUILD_VERSION=$PACKAGE_VERSION"
+            echo "SKLINT_BUILD_REVISION=v$PACKAGE_VERSION"
+            echo "SKLINT_CARGO_PROFILE=release"
+            echo "SKLINT_WHEEL_PLATFORM_TAG=manylinux_2_35_aarch64"
+          } >> "$GITHUB_ENV"
+      - name: Audits and locked Rust gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/audit-rule-docs.py
+          python scripts/audit-fix-coverage.py
+          python scripts/audit-pydoclint-port.py
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --release --locked -p sklint
+      - name: Build glibc aarch64 wheel and enforce GLIBC ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binutils
+          python -m pip install --upgrade pip build wheel twine
+          rm -rf dist
+          python -m build --wheel --outdir dist
+          python .github/scripts/ci_sklint.py verify-dist --dir dist --platform-tag manylinux_2_35_aarch64
+          python -m twine check dist/*
+          bin=target/release/sklint
+          max_glibc="$(readelf --version-info "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | tail -n1 || true)"
+          test -n "$max_glibc"
+          number="${max_glibc#GLIBC_}"
+          test "$(printf '%s\n%s\n' "$number" '2.35' | sort -V | head -n1)" = "$number"
+          echo "max_glibc=$max_glibc"
+          python .github/scripts/ci_sklint.py verify-provenance --binary "$bin" --target aarch64-unknown-linux-gnu
+      - name: Installed-package smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf verify-venv
+          python -m venv verify-venv
+          verify-venv/bin/python .github/scripts/ci_python_policy.py --verify
+          verify-venv/bin/python -m pip install --no-index --no-deps "dist/sklint-${PACKAGE_VERSION}-py3-none-manylinux_2_35_aarch64.whl"
+          verify-venv/bin/python .github/scripts/ci_sklint.py smoke
+          test -z "$(git status --porcelain)"
+      - name: Upload glibc aarch64 wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-dist-glibc-aarch64
+          if-no-files-found: error
+          path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-manylinux_2_35_aarch64.whl
+
+  musl_x86_64:
+    name: Linux musl x86_64 / native wheel validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build and validate in Alpine 3.24
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e PACKAGE_VERSION -e PYTHON_JIT -e GITHUB_SHA -e RUST_TOOLCHAIN -e EXPECTED_RUSTC \
+            -v "$PWD:/src" -w /src alpine:3.24 sh -euxc '
+              apk add --no-cache bash curl ca-certificates libstdc++ jq build-base musl-dev linux-headers git
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="/root/.local/bin:$PATH"
+              LATEST_VERSION="$(
+                uv python list ">=3.14+freethreaded" --all-versions --only-downloads --output-format json |
+                jq -r "[.[] | select(.implementation == \"cpython\") | select(.variant == \"freethreaded\") | select(.version | test(\"^[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\")) | .version] | sort_by(split(\".\") | map(tonumber)) | last // empty"
+              )"
+              test -n "$LATEST_VERSION"
+              LATEST_SPEC="${LATEST_VERSION}+freethreaded"
+              echo "Latest stable free-threaded candidate: $LATEST_SPEC"
+              uv python install "$LATEST_SPEC"
+              rm -rf /tmp/venv
+              uv venv --python "$LATEST_SPEC" --managed-python --seed /tmp/venv
+              export PATH="/tmp/venv/bin:/root/.local/bin:$PATH"
+              export PYTHON_JIT=1
+              python .github/scripts/ci_python_policy.py --verify
+              python .github/scripts/ci_sklint.py verify-versions
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+              export PATH="$HOME/.cargo/bin:$PATH"
+              rustup component add rustfmt clippy --toolchain "$RUST_TOOLCHAIN"
+              test "$(rustc --version)" = "$EXPECTED_RUSTC"
+              tree_sha="$(python .github/scripts/ci_sklint.py source-manifest --output /tmp/SOURCE_MANIFEST.txt)"
+              export SKLINT_SOURCE_TREE_SHA256="$tree_sha"
+              export SKLINT_SOURCE_COMMIT="$GITHUB_SHA"
+              export SKLINT_SOURCE_DIRTY=false
+              export SKLINT_BUILD_VERSION="$PACKAGE_VERSION"
+              export SKLINT_BUILD_REVISION="v$PACKAGE_VERSION"
+              export SKLINT_CARGO_PROFILE=release
+              export SKLINT_WHEEL_PLATFORM_TAG=musllinux_1_2_x86_64
+              python scripts/audit-rule-docs.py
+              python scripts/audit-fix-coverage.py
+              python scripts/audit-pydoclint-port.py
+              cargo fmt --all -- --check
+              cargo test --workspace --locked
+              cargo clippy --workspace --all-targets --locked -- -D warnings
+              cargo build --release --locked -p sklint
+              rm -rf dist
+              python -m pip install --upgrade build wheel twine
+              python -m build --wheel --outdir dist
+              python .github/scripts/ci_sklint.py verify-dist --dir dist --platform-tag musllinux_1_2_x86_64
+              python -m twine check dist/*
+              python .github/scripts/ci_sklint.py verify-provenance --binary target/release/sklint --target x86_64-unknown-linux-musl
+              rm -rf /tmp/verify
+              uv venv --python "$LATEST_SPEC" --managed-python --seed /tmp/verify
+              PYTHON_JIT=1 /tmp/verify/bin/python .github/scripts/ci_python_policy.py --verify
+              /tmp/verify/bin/python -m pip install --no-index --no-deps "dist/sklint-${PACKAGE_VERSION}-py3-none-musllinux_1_2_x86_64.whl"
+              /tmp/verify/bin/python .github/scripts/ci_sklint.py smoke
+              test -z "$(git status --porcelain)"
+              chmod -R a+rX dist
+            '
+      - name: Upload musl x86_64 wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-dist-musl-x86_64
+          if-no-files-found: error
+          path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-musllinux_1_2_x86_64.whl
+
+  musl_aarch64:
+    name: Linux musl aarch64 / native wheel validation
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build and validate in Alpine 3.24
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e PACKAGE_VERSION -e PYTHON_JIT -e GITHUB_SHA -e RUST_TOOLCHAIN -e EXPECTED_RUSTC \
+            -v "$PWD:/src" -w /src alpine:3.24 sh -euxc '
+              apk add --no-cache bash curl ca-certificates libstdc++ jq build-base musl-dev linux-headers git
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="/root/.local/bin:$PATH"
+              LATEST_VERSION="$(
+                uv python list ">=3.14+freethreaded" --all-versions --only-downloads --output-format json |
+                jq -r "[.[] | select(.implementation == \"cpython\") | select(.variant == \"freethreaded\") | select(.version | test(\"^[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\")) | .version] | sort_by(split(\".\") | map(tonumber)) | last // empty"
+              )"
+              test -n "$LATEST_VERSION"
+              LATEST_SPEC="${LATEST_VERSION}+freethreaded"
+              echo "Latest stable free-threaded candidate: $LATEST_SPEC"
+              uv python install "$LATEST_SPEC"
+              rm -rf /tmp/venv
+              uv venv --python "$LATEST_SPEC" --managed-python --seed /tmp/venv
+              export PATH="/tmp/venv/bin:/root/.local/bin:$PATH"
+              export PYTHON_JIT=1
+              python .github/scripts/ci_python_policy.py --verify
+              python .github/scripts/ci_sklint.py verify-versions
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+              export PATH="$HOME/.cargo/bin:$PATH"
+              rustup component add rustfmt clippy --toolchain "$RUST_TOOLCHAIN"
+              test "$(rustc --version)" = "$EXPECTED_RUSTC"
+              tree_sha="$(python .github/scripts/ci_sklint.py source-manifest --output /tmp/SOURCE_MANIFEST.txt)"
+              export SKLINT_SOURCE_TREE_SHA256="$tree_sha"
+              export SKLINT_SOURCE_COMMIT="$GITHUB_SHA"
+              export SKLINT_SOURCE_DIRTY=false
+              export SKLINT_BUILD_VERSION="$PACKAGE_VERSION"
+              export SKLINT_BUILD_REVISION="v$PACKAGE_VERSION"
+              export SKLINT_CARGO_PROFILE=release
+              export SKLINT_WHEEL_PLATFORM_TAG=musllinux_1_2_aarch64
+              python scripts/audit-rule-docs.py
+              python scripts/audit-fix-coverage.py
+              python scripts/audit-pydoclint-port.py
+              cargo fmt --all -- --check
+              cargo test --workspace --locked
+              cargo clippy --workspace --all-targets --locked -- -D warnings
+              cargo build --release --locked -p sklint
+              rm -rf dist
+              python -m pip install --upgrade build wheel twine
+              python -m build --wheel --outdir dist
+              python .github/scripts/ci_sklint.py verify-dist --dir dist --platform-tag musllinux_1_2_aarch64
+              python -m twine check dist/*
+              python .github/scripts/ci_sklint.py verify-provenance --binary target/release/sklint --target aarch64-unknown-linux-musl
+              rm -rf /tmp/verify
+              uv venv --python "$LATEST_SPEC" --managed-python --seed /tmp/verify
+              PYTHON_JIT=1 /tmp/verify/bin/python .github/scripts/ci_python_policy.py --verify
+              /tmp/verify/bin/python -m pip install --no-index --no-deps "dist/sklint-${PACKAGE_VERSION}-py3-none-musllinux_1_2_aarch64.whl"
+              /tmp/verify/bin/python .github/scripts/ci_sklint.py smoke
+              test -z "$(git status --porcelain)"
+              chmod -R a+rX dist
+            '
+      - name: Upload musl aarch64 wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-dist-musl-aarch64
+          if-no-files-found: error
+          path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-musllinux_1_2_aarch64.whl
+
+  publish:
+    name: Publish platform-validated artifacts to devpi
+    runs-on: ubuntu-24.04
+    needs:
+      - windows_x86_64
+      - glibc_x86_64
+      - glibc_aarch64
+      - musl_x86_64
+      - musl_aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up CI Python
+        uses: ./.github/actions/setup-ci-python
+      - name: Verify package versions
+        run: python .github/scripts/ci_sklint.py verify-versions
+      - name: Determine publish intent
+        id: publish_intent
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          current_version="$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          PY
+          )"
+          if [ "$current_version" != "$PACKAGE_VERSION" ]; then
+            echo "::error::PACKAGE_VERSION=$PACKAGE_VERSION does not match pyproject.toml version=$current_version"
+            exit 1
+          fi
+
+          should_publish=false
+          previous_version=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            should_publish=true
+            echo "Manual workflow_dispatch: publication requested."
+          elif [ "$EVENT_NAME" = "push" ]; then
+            if [ -z "${BEFORE_SHA:-}" ] || [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "::error::Push event has no usable before SHA; refusing to infer publication intent."
+              exit 1
+            fi
+            if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Push before SHA is unavailable in checkout; refusing to infer publication intent."
+              exit 1
+            fi
+            if ! git cat-file -e "${BEFORE_SHA}:pyproject.toml" 2>/dev/null; then
+              echo "::error::Previous pyproject.toml is unavailable; refusing to infer publication intent."
+              exit 1
+            fi
+            previous_version="$(git show "${BEFORE_SHA}:pyproject.toml" | python -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
+            if [ "$previous_version" != "$current_version" ]; then
+              should_publish=true
+            fi
+          else
+            echo "::error::Unexpected event for publication intent: $EVENT_NAME"
+            exit 1
+          fi
+
+          echo "previous_version=${previous_version:-unavailable}"
+          echo "current_version=$current_version"
+          echo "should_publish=$should_publish"
+          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+      - name: Validation-only push; publication skipped
+        if: steps.publish_intent.outputs.should_publish != 'true'
+        shell: bash
+        run: echo "Package version is unchanged; all platform validation passed and devpi publication is intentionally skipped."
+      - name: Download platform distributions
+        if: steps.publish_intent.outputs.should_publish == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sklint-dist-*
+          path: dist
+          merge-multiple: true
+      - name: Verify exact publish set
+        if: steps.publish_intent.outputs.should_publish == 'true'
+        run: python .github/scripts/ci_sklint.py verify-publish-set --dir dist
+      - name: Install publish tools
+        if: steps.publish_intent.outputs.should_publish == 'true'
+        run: python -m pip install --upgrade pip twine devpi-client devpi-tokens
+      - name: Twine check
+        if: steps.publish_intent.outputs.should_publish == 'true'
+        run: python -m twine check dist/*
+      - name: Authenticated collision check, integration and publish
+        if: steps.publish_intent.outputs.should_publish == 'true'
+        shell: bash
+        env:
+          DEVPI_TOKEN: ${{ secrets.DEVPI_TOKEN }}
+          DEVPI_CLIENTDIR: ${{ runner.temp }}/devpi-client
+          PIP_CONFIG_FILE: ${{ runner.temp }}/pip.conf
+        run: |
+          set -euo pipefail
+          TOKEN_FILE="$(mktemp)"
+          PROJECT_JSON="$(mktemp)"
+          PROJECT_ERR="$(mktemp)"
+          AFTER_JSON="$(mktemp)"
+          cleanup() {
+            rm -f "$TOKEN_FILE" "$PROJECT_JSON" "$PROJECT_ERR" "$AFTER_JSON" "$PIP_CONFIG_FILE"
+            rm -rf "$DEVPI_CLIENTDIR"
+          }
+          trap cleanup EXIT
+          if [ -z "${DEVPI_TOKEN:-}" ]; then
+            echo "::error::DEVPI_TOKEN is not available to this repository."
+            exit 1
+          fi
+          printf '%s' "$DEVPI_TOKEN" > "$TOKEN_FILE"
+          chmod 600 "$TOKEN_FILE"
+          devpi use "$DEVPI_SERVER"
+          devpi token-login -f "$TOKEN_FILE"
+          devpi use --set-cfg "$DEVPI_TARGET_INDEX"
+
+          set +e
+          devpi getjson /StableKite/index/sklint > "$PROJECT_JSON" 2> "$PROJECT_ERR"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            PROJECT_JSON="$PROJECT_JSON" PACKAGE_VERSION="$PACKAGE_VERSION" python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          expected = tuple(map(int, os.environ["PACKAGE_VERSION"].split(".")))
+          data = json.loads(Path(os.environ["PROJECT_JSON"]).read_text())
+          if not isinstance(data, dict):
+              raise SystemExit("Unexpected devpi project JSON schema")
+          payload = data.get("result", data)
+          if not isinstance(payload, dict):
+              raise SystemExit("Unexpected devpi project result schema")
+          version_keys = [k for k in payload if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(k))]
+          if payload and not version_keys:
+              raise SystemExit("Could not identify versions in devpi project JSON")
+          versions = sorted(tuple(map(int, k.split("."))) for k in version_keys)
+          bad = [v for v in versions if v >= expected]
+          if bad:
+              raise SystemExit(f"Refusing publish; devpi already has conflicting/newer versions: {bad}")
+          print("Authenticated devpi collision check OK")
+          PY
+          else
+            cat "$PROJECT_JSON" >&2 || true
+            cat "$PROJECT_ERR" >&2 || true
+            if grep -Eqi '(^|[[:space:]])404[[:space:]]+Not Found([:[:space:]]|$)' "$PROJECT_JSON" "$PROJECT_ERR"; then
+              echo "Authenticated devpi project is not listed; release is collision-free."
+            else
+              echo "::error::Could not reliably inspect SKLint publication history on devpi."
+              exit 1
+            fi
+          fi
+
+          python -m pip install --no-deps --force-reinstall "dist/sklint-${PACKAGE_VERSION}-py3-none-manylinux_2_35_x86_64.whl"
+          python .github/scripts/ci_python_policy.py --verify
+          python -m pip check
+          python .github/scripts/ci_sklint.py smoke
+
+          devpi upload dist/*
+          devpi getjson /StableKite/index/sklint > "$AFTER_JSON"
+          AFTER_JSON="$AFTER_JSON" PACKAGE_VERSION="$PACKAGE_VERSION" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          version = os.environ["PACKAGE_VERSION"]
+          data = json.loads(Path(os.environ["AFTER_JSON"]).read_text())
+          if not isinstance(data, dict):
+              raise SystemExit("Unexpected devpi confirmation JSON schema")
+          payload = data.get("result", data)
+          if not isinstance(payload, dict) or version not in payload:
+              raise SystemExit(f"Published version {version} not confirmed by devpi")
+          print(f"devpi publication confirmed: sklint {version}")
+          PY

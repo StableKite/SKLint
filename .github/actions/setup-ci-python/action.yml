@@ -1,0 +1,14 @@
+name: Set up latest stable free-threaded CPython
+description: Select the newest stable free-threaded CPython and enforce the StableKite JIT policy
+runs:
+  using: composite
+  steps:
+    - name: Set up latest stable free-threaded CPython
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.x"
+        freethreaded: true
+        allow-prereleases: false
+    - name: Verify selected CI Python
+      shell: bash
+      run: python .github/scripts/ci_python_policy.py --verify
