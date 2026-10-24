@@ -321,6 +321,46 @@ CLI-команда `sklint format` и VSCode formatter используют од
 
 Если описание аргумента, атрибута или исключения не помещается на одну строку, оно должно начинаться со следующей строки после дополнительного отступа.
 
+## SK625 — PrivateMethodDocstringMissing
+
+**Уровень:** strict-only.
+**Autofix:** нет.
+
+В strict-режиме приватный метод класса (`_method`, `__helper`) должен иметь собственный докстринг. Это правило не применяется к локальным вложенным функциям, к setter/deleter свойства и к методам с `@overload`, `@typing.override` или явно отключённым декоратором. Геттеры `@property` проверяет отдельное SK627.
+
+## SK626 — PrivateClassDocstringMissing
+
+**Уровень:** strict-only.
+**Autofix:** нет.
+
+Приватные классы (в том числе вложенные) должны иметь докстринг класса. Настроенный явно игнорируемый декоратор может исключить соответствующий класс.
+
+## SK627 — PrivatePropertyDocstringMissing
+
+**Уровень:** strict-only.
+**Autofix:** нет.
+
+Приватный геттер `@property` или `@functools.cached_property` должен иметь докстринг. Методы `@getter.setter` и `@getter.deleter` повторно не проверяются; декораторы `@overload`, `@typing.override` и явно отключённые исключены.
+
+## SK628 — PrivateConstantDocstringMissing
+
+**Уровень:** strict-only.
+**Autofix:** нет.
+
+Приватной константе с именем вида `_MAX_RETRIES` на уровне модуля или класса требуется непосредственно следующий строковый литерал-описание, как у `SK609`. Локальные переменные функций, `__all__` и неподтверждённые верхним регистром имена не затрагиваются. **`Final`, распознаваемый SK609 (`: Final` / `:Final`), исключён из SK628**, без двойной диагностики. Для aliased/qualified `Final`, ещё не распознаваемого SK609, strict-only SK628 сохраняет проверку, чтобы отсутствие описания не осталось незамеченным.
+
+Все новые правила SK625–SK628 работают **только в strict-режиме** (явный `select` при strict=false не активирует их). Они не применяются к `.pyi` и `.ipynb`, но существующие проверки этих файлов остаются без изменений. Подавления `# noqa: SK625` и `[tool.sklint].ignore` работают по обычному механизму SKLint.
+
+Настраиваемое исключение для декораторов в `pyproject.toml`:
+
+```toml
+[tool.sklint]
+strict = true
+docstring_ignore_decorators = ["myapp.decorators.generated"]
+```
+
+Также читается стандартное `[tool.ruff.lint.pydocstyle].ignore-decorators` из **этого же `pyproject.toml`**, если не указан свой `docstring_ignore_decorators`. Обрабатываются импортные алиасы и декораторы-вызовы. Поддержка отдельного `ruff.toml` не заявляется.
+
 ## SK701 — DynamicSelfAttributeOutsideInit
 
 **Уровень:** обычный.  

@@ -494,7 +494,7 @@ struct PythonStringState {
     triple: bool,
 }
 
-fn python_comment_starts(source: &str) -> Vec<Option<usize>> {
+pub(crate) fn python_comment_starts(source: &str) -> Vec<Option<usize>> {
     let mut state: Option<PythonStringState> = None;
     source
         .lines()

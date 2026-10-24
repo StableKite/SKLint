@@ -2,13 +2,14 @@ use crate::blank_lines::run_blank_line_rules;
 use crate::comments::run_comment_rules;
 use crate::config::{load_pyproject_for_file, parse_inline_config, EffectiveConfig, VscodeConfig};
 use crate::diagnostic::{Diagnostic, Fix, Span};
+use crate::docstring_presence::run_docstring_presence_rules;
 use crate::docstrings::run_docstring_rules;
 use crate::dynamic_attrs::run_dynamic_attribute_rules;
 use crate::magic_constants::run_magic_constant_rule;
 use crate::pydoclint::run_pydoclint_rules;
 use crate::python_ast::{cpython_syntax_status, PythonAst, SyntaxOracleStatus};
 use crate::rules::rule_by_code;
-use crate::suppression::{unused_selector_replacement, SuppressionState};
+use crate::suppression::{python_comment_starts, unused_selector_replacement, SuppressionState};
 use crate::syntax_rules::run_syntax_rules;
 use std::path::{Path, PathBuf};
 
@@ -492,12 +493,19 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
     }
 
     if config.is_enabled("SK101") {
+        // Share the lexer used by SKLint suppressions: a `#` inside a Python
+        // string literal is not the beginning of a real comment.
+        let comment_starts = python_comment_starts(source);
         for (idx, line) in source.lines().enumerate() {
-            if let Some(comment_idx) = line.find('#') {
+            if let Some(comment_idx) = comment_starts.get(idx).copied().flatten() {
                 let comment = &line[comment_idx..];
                 if let Some(todo_idx) = comment.to_ascii_lowercase().find("todo") {
                     let line_no = idx + 1;
-                    let column = line[..comment_idx].chars().count() + todo_idx + 1;
+                    // `find` returns a byte offset; diagnostic columns count
+                    // Unicode scalar values, including non-ASCII comment text.
+                    let column = line[..comment_idx].chars().count()
+                        + comment[..todo_idx].chars().count()
+                        + 1;
                     diagnostics.push(Diagnostic::new(
                         "SK101",
                         "TODO comments are not allowed in strict mode",
@@ -537,6 +545,7 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
     diagnostics.extend(run_comment_rules(path, source, config));
     diagnostics.extend(run_blank_line_rules(path, source, config));
     diagnostics.extend(run_docstring_rules(path, source, config));
+    diagnostics.extend(run_docstring_presence_rules(path, source, config));
     diagnostics.extend(run_pydoclint_rules(path, source, config));
     diagnostics.extend(run_dynamic_attribute_rules(path, source, config));
     diagnostics.extend(run_magic_constant_rule(path, source, config));
@@ -560,6 +569,59 @@ mod tests {
             source: source.to_string(),
             vscode_config: VscodeConfig::default(),
         }
+    }
+
+    #[test]
+    fn sk101_ignores_hash_and_todo_inside_python_string_literals() {
+        let report = analyze(input(
+            r###"# sklint: strict
+single = '# TODO: inside string'
+double = "# TODO: inside string"
+raw = r"# TODO: inside raw string"
+formatted = f"# TODO: inside f-string"
+multiline = """
+# TODO: inside triple-quoted text
+"""
+"###,
+        ));
+        assert!(report.diagnostics.iter().all(|d| d.code != "SK101"));
+    }
+
+    #[test]
+    fn sk101_reports_real_todo_comment_after_quoted_hash_with_unicode_column() {
+        let line = "value = '# TODO: string'  # пояснение TODO: real";
+        let report = analyze(input(&format!("# sklint: strict\n{line}\n")));
+        let warnings = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "SK101")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].line, 2);
+        let byte_offset = line.rfind("TODO").expect("real TODO");
+        assert_eq!(warnings[0].column, line[..byte_offset].chars().count() + 1);
+    }
+
+    #[test]
+    fn sk101_is_strict_only_and_respects_noqa() {
+        let ordinary = analyze(input("value = 1  # TODO: ordinary mode\n"));
+        assert!(ordinary.diagnostics.iter().all(|d| d.code != "SK101"));
+
+        let suppressed = analyze(input(
+            "# sklint: strict\nvalue = 1  # TODO: real  # noqa: SK101\n",
+        ));
+        assert!(suppressed.diagnostics.iter().all(|d| d.code != "SK101"));
+        assert!(suppressed.diagnostics.iter().all(|d| d.code != "SK900"));
+
+        let unsuppressed = analyze(input("# sklint: strict\nvalue = 1  # TODO: real\n"));
+        assert_eq!(
+            unsuppressed
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "SK101")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -376,6 +376,30 @@ pub const ALL_RULES: &[Rule] = &[
         summary: "Long argument, attribute and exception descriptions must start on the next indented line",
     },
     Rule {
+        code: "SK625",
+        name: "PrivateMethodDocstringMissing",
+        level: RuleLevel::Strict,
+        summary: "Private methods must have docstrings in strict mode",
+    },
+    Rule {
+        code: "SK626",
+        name: "PrivateClassDocstringMissing",
+        level: RuleLevel::Strict,
+        summary: "Private classes must have docstrings in strict mode",
+    },
+    Rule {
+        code: "SK627",
+        name: "PrivatePropertyDocstringMissing",
+        level: RuleLevel::Strict,
+        summary: "Private property getters must have docstrings in strict mode",
+    },
+    Rule {
+        code: "SK628",
+        name: "PrivateConstantDocstringMissing",
+        level: RuleLevel::Strict,
+        summary: "Private uppercase constants without Final must have descriptions",
+    },
+    Rule {
         code: "SKD001",
         name: "DocstringParseError",
         level: RuleLevel::Strict,

@@ -64,6 +64,8 @@ pub struct PyProjectConfig {
     /// Additional function/method names or `*` patterns that define an
     /// explicit exception boundary for SK506.
     pub exception_boundary_functions: Vec<String>,
+    /// Decorators that disable only the new strict missing-docstring checks.
+    pub docstring_ignore_decorators: Vec<String>,
     /// Configuration errors discovered while parsing `[tool.sklint]`.
     /// CLI entry points fail-fast on these instead of silently linting with
     /// a partially applied configuration.
@@ -90,6 +92,7 @@ pub struct EffectiveConfig {
     pub pydoclint_overrides: PydoclintCliOverrides,
     pub assertion_helpers: Vec<String>,
     pub exception_boundary_functions: Vec<String>,
+    pub docstring_ignore_decorators: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -170,6 +173,9 @@ impl EffectiveConfig {
             } else {
                 Vec::new()
             },
+            // Also accept an existing [tool.ruff.lint.pydocstyle] section
+            // in pyproject.toml even without a SKLint-specific section.
+            docstring_ignore_decorators: pyproject.docstring_ignore_decorators.clone(),
         }
     }
 
@@ -249,12 +255,15 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
         Sklint,
         Pydoclint,
         SklintPydoclint,
+        RuffPydocstyle,
     }
 
     let mut section = Section::None;
     let mut config = PyProjectConfig::default();
     let mut upstream_pydoclint_style = None;
     let mut sklint_pydoclint_style = None;
+    let mut ruff_ignored_decorators = Vec::new();
+    let mut sklint_ignored_decorators = None;
 
     for line_without_comment in logical_toml_lines(text) {
         if line_without_comment.starts_with('[') && line_without_comment.ends_with(']') {
@@ -265,6 +274,7 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
                 }
                 "[tool.pydoclint]" => Section::Pydoclint,
                 "[tool.sklint.pydoclint]" => Section::SklintPydoclint,
+                "[tool.ruff.lint.pydocstyle]" => Section::RuffPydocstyle,
                 _ => Section::None,
             };
             continue;
@@ -311,6 +321,14 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
                             .push(format!("[tool.sklint] {key} {message}")),
                     }
                 }
+                "docstring-ignore-decorators" | "docstring_ignore_decorators" => {
+                    match parse_string_array_preserving_case(value) {
+                        Ok(parsed) => sklint_ignored_decorators = Some(parsed),
+                        Err(message) => config
+                            .errors
+                            .push(format!("[tool.sklint] {key} {message}")),
+                    }
+                }
                 "formatter-docstring-style" | "formatter_docstring_style" => {
                     match DocStyle::parse(trim_toml_string(value)) {
                         Some(style) if is_quoted_toml_string(value) => {
@@ -337,6 +355,14 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
             Section::SklintPydoclint if key.replace('-', "_").eq_ignore_ascii_case("style") => {
                 sklint_pydoclint_style = DocStyle::parse(trim_toml_string(value));
             }
+            Section::RuffPydocstyle if key == "ignore-decorators" => {
+                match parse_string_array_preserving_case(value) {
+                    Ok(parsed) => ruff_ignored_decorators = parsed,
+                    Err(message) => config
+                        .errors
+                        .push(format!("[tool.ruff.lint.pydocstyle] {key} {message}")),
+                }
+            }
             _ => {}
         }
     }
@@ -346,6 +372,9 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
     normalize_code_list(&mut config.ignore);
     normalize_pattern_list(&mut config.assertion_helpers);
     normalize_pattern_list(&mut config.exception_boundary_functions);
+    config.docstring_ignore_decorators =
+        sklint_ignored_decorators.unwrap_or(ruff_ignored_decorators);
+    normalize_pattern_list(&mut config.docstring_ignore_decorators);
     validate_selectors("select", &config.select, &mut config.errors);
     validate_selectors("ignore", &config.ignore, &mut config.errors);
     config.errors.sort();
@@ -729,6 +758,24 @@ exception_boundary_functions = ["close", "shutdown", "_rollback_*"]
             vec!["_rollback_*", "close", "shutdown"]
         );
         assert!(parsed.errors.is_empty());
+    }
+
+    #[test]
+    fn docstring_ignored_decorators_support_sklint_and_ruff_pyproject_config() {
+        let ruff = parse_pyproject_toml(
+            "[tool.ruff.lint.pydocstyle]\nignore-decorators = [\"custom.hidden\", \"typing.override\"]\n",
+        );
+        assert_eq!(
+            ruff.docstring_ignore_decorators,
+            vec!["custom.hidden", "typing.override"]
+        );
+        let sklint = parse_pyproject_toml(
+            "[tool.ruff.lint.pydocstyle]\nignore-decorators = [\"custom.old\"]\n[tool.sklint]\ndocstring_ignore_decorators = [\"custom.new\"]\n",
+        );
+        assert_eq!(sklint.docstring_ignore_decorators, vec!["custom.new"]);
+        assert!(sklint.errors.is_empty());
+        let malformed = parse_pyproject_toml("[tool.sklint]\ndocstring-ignore-decorators = [7]\n");
+        assert!(!malformed.errors.is_empty());
     }
 
     #[test]

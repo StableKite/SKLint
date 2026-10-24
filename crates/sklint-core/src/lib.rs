@@ -10,6 +10,7 @@ pub mod comments;
 pub mod config;
 pub mod dataclass_model;
 pub mod diagnostic;
+pub mod docstring_presence;
 pub mod docstrings;
 pub mod dynamic_attrs;
 pub mod formatter;
