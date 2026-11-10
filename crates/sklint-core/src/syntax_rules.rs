@@ -1084,9 +1084,14 @@ fn run_top_level_definition_order(
     defs: &[DefInfo],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let top: Vec<&DefInfo> = defs.iter().filter(|def| def.indent == 0).collect();
+    let mut top: Vec<&DefInfo> = defs.iter().filter(|def| def.indent == 0).collect();
+    top.sort_by_key(|def| def.start);
+    let mut first_bindings = BTreeSet::new();
     for def in &top {
-        if def.name.starts_with('_') {
+        // A definition binds its name; a later overload or redefinition does
+        // not turn that earlier declaration (or a call after it) into a use
+        // before the first binding. Check each name at its earliest definition.
+        if def.name.starts_with('_') || !first_bindings.insert(def.name.as_str()) {
             continue;
         }
         for line in lines.iter().take(def.start.saturating_sub(1)) {
@@ -3078,6 +3083,45 @@ print(sys.executable)
                 "deferred lookup must not be SK505: {source}"
             );
         }
+    }
+
+    #[test]
+    fn sk505_allows_real_overload_groups_with_and_without_exports() {
+        for exports in ["", "__all__ = (\"convert\",)\n"] {
+            let source = format!(
+                "from typing import Literal, overload\n{exports}\n@overload\ndef convert(value: Literal[0]) -> int:\n    ...\n\n@overload\ndef convert(value: Literal[1]) -> str:\n    ...\n\ndef convert(value: int) -> int | str:\n    return value if value == 0 else str(value)\n\nresult = convert(0)\n"
+            );
+            assert!(
+                !codes(&source, false).contains(&"SK505".to_string()),
+                "valid overload declarations are definitions, not eager calls: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sk505_allows_redefinitions_after_an_existing_binding() {
+        for source in [
+            "def value():\n    return 1\n\nfirst = value()\n\ndef value():\n    return 2\n\nsecond = value()\n",
+            "class Value:\n    pass\n\nfirst = Value()\n\nclass Value:\n    pass\n\nsecond = Value()\n",
+        ] {
+            assert!(
+                !codes(source, false).contains(&"SK505".to_string()),
+                "the first real binding makes the intervening call valid: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sk505_keeps_real_early_use_before_overloads_once() {
+        let source = "from typing import overload\nresult = later(0)\n\n@overload\ndef later(value: int) -> int:\n    ...\n\n@overload\ndef later(value: str) -> str:\n    ...\n\ndef later(value: int | str) -> int | str:\n    return value\n";
+        assert_eq!(
+            codes(source, false)
+                .into_iter()
+                .filter(|code| code == "SK505")
+                .count(),
+            1,
+            "a real eager call before every binding still needs one diagnostic"
+        );
     }
 
     #[test]
