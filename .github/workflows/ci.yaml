@@ -5,6 +5,16 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the validated version from the exact default branch
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sklint-publication-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -14,8 +24,6 @@ env:
   PYTHON_JIT: "1"
   RUST_TOOLCHAIN: "1.98.0"
   EXPECTED_RUSTC: "rustc 1.98.0 (88d9e12ae 2026-08-18)"
-  DEVPI_SERVER: "https://stablekite.com:4438/"
-  DEVPI_TARGET_INDEX: "https://stablekite.com:4438/StableKite/index/"
 
 jobs:
   windows_x86_64:
@@ -440,7 +448,7 @@ jobs:
           path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-musllinux_1_2_aarch64.whl
 
   publish:
-    name: Publish platform-validated artifacts to devpi
+    name: Validate publication intent and publish the exact checked set
     runs-on: ubuntu-24.04
     needs:
       - windows_x86_64
@@ -453,159 +461,59 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Set up CI Python
         uses: ./.github/actions/setup-ci-python
       - name: Verify package versions
         run: python .github/scripts/ci_sklint.py verify-versions
-      - name: Determine publish intent
-        id: publish_intent
-        shell: bash
+      - name: Install offline gate dependencies
+        run: python -m pip install packaging requests
+      - name: Check publication failure controls without credentials or production requests
+        run: python -I .github/scripts/test_ci_publish.py
+      - name: Determine fail-closed publication intent
+        id: release
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          current_version="$(python - <<'PY'
-          import tomllib
-          with open("pyproject.toml", "rb") as f:
-              print(tomllib.load(f)["project"]["version"])
-          PY
-          )"
-          if [ "$current_version" != "$PACKAGE_VERSION" ]; then
-            echo "::error::PACKAGE_VERSION=$PACKAGE_VERSION does not match pyproject.toml version=$current_version"
-            exit 1
-          fi
-
-          should_publish=false
-          previous_version=""
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            should_publish=true
-            echo "Manual workflow_dispatch: publication requested."
-          elif [ "$EVENT_NAME" = "push" ]; then
-            if [ -z "${BEFORE_SHA:-}" ] || [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
-              echo "::error::Push event has no usable before SHA; refusing to infer publication intent."
-              exit 1
-            fi
-            if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-              echo "::error::Push before SHA is unavailable in checkout; refusing to infer publication intent."
-              exit 1
-            fi
-            if ! git cat-file -e "${BEFORE_SHA}:pyproject.toml" 2>/dev/null; then
-              echo "::error::Previous pyproject.toml is unavailable; refusing to infer publication intent."
-              exit 1
-            fi
-            previous_version="$(git show "${BEFORE_SHA}:pyproject.toml" | python -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
-            if [ "$previous_version" != "$current_version" ]; then
-              should_publish=true
-            fi
-          else
-            echo "::error::Unexpected event for publication intent: $EVENT_NAME"
-            exit 1
-          fi
-
-          echo "previous_version=${previous_version:-unavailable}"
-          echo "current_version=$current_version"
-          echo "should_publish=$should_publish"
-          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
-      - name: Validation-only push; publication skipped
-        if: steps.publish_intent.outputs.should_publish != 'true'
-        shell: bash
-        run: echo "Package version is unchanged; all platform validation passed and devpi publication is intentionally skipped."
-      - name: Download platform distributions
-        if: steps.publish_intent.outputs.should_publish == 'true'
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python -I .github/scripts/ci_publish.py plan . "${{ runner.temp }}/sklint-publication"
+      - name: Validation only; authentication, collision checks and uploads are skipped
+        if: steps.release.outputs.should_publish != 'true'
+        run: echo "Validation only. PLAN.json records the verified previous and current versions. No devpi credentials are used."
+      - name: Authenticated collision check with separate read credential
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          DEVPI_READ_TOKEN: ${{ secrets.DEVPI_READ_TOKEN }}
+        run: python -I .github/scripts/ci_publish.py collision . "${{ runner.temp }}/sklint-publication"
+      - name: Download the original distributions from this run
+        if: steps.release.outputs.should_publish == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: sklint-dist-*
-          path: dist
+          path: ${{ runner.temp }}/sklint-platform-distributions
           merge-multiple: true
-      - name: Verify exact publish set
-        if: steps.publish_intent.outputs.should_publish == 'true'
-        run: python .github/scripts/ci_sklint.py verify-publish-set --dir dist
-      - name: Install publish tools
-        if: steps.publish_intent.outputs.should_publish == 'true'
-        run: python -m pip install --upgrade pip twine devpi-client devpi-tokens
-      - name: Twine check
-        if: steps.publish_intent.outputs.should_publish == 'true'
-        run: python -m twine check dist/*
-      - name: Authenticated collision check, integration and publish
-        if: steps.publish_intent.outputs.should_publish == 'true'
-        shell: bash
+      - name: Install upload tools only for an authorized publication
+        if: steps.release.outputs.should_publish == 'true'
+        run: python -m pip install twine==7.0.0 setuptools
+      - name: Verify exact native artifacts and original installed-package integration
+        if: steps.release.outputs.should_publish == 'true'
+        run: python -I .github/scripts/ci_publish.py validate . "${{ runner.temp }}/sklint-publication" --artifacts "${{ runner.temp }}/sklint-platform-distributions"
+      - name: Upload each checked original once using write-only credential
+        if: steps.release.outputs.should_publish == 'true'
         env:
           DEVPI_TOKEN: ${{ secrets.DEVPI_TOKEN }}
-          DEVPI_CLIENTDIR: ${{ runner.temp }}/devpi-client
-          PIP_CONFIG_FILE: ${{ runner.temp }}/pip.conf
-        run: |
-          set -euo pipefail
-          TOKEN_FILE="$(mktemp)"
-          PROJECT_JSON="$(mktemp)"
-          PROJECT_ERR="$(mktemp)"
-          AFTER_JSON="$(mktemp)"
-          cleanup() {
-            rm -f "$TOKEN_FILE" "$PROJECT_JSON" "$PROJECT_ERR" "$AFTER_JSON" "$PIP_CONFIG_FILE"
-            rm -rf "$DEVPI_CLIENTDIR"
-          }
-          trap cleanup EXIT
-          if [ -z "${DEVPI_TOKEN:-}" ]; then
-            echo "::error::DEVPI_TOKEN is not available to this repository."
-            exit 1
-          fi
-          printf '%s' "$DEVPI_TOKEN" > "$TOKEN_FILE"
-          chmod 600 "$TOKEN_FILE"
-          devpi use "$DEVPI_SERVER"
-          devpi token-login -f "$TOKEN_FILE"
-          devpi use --set-cfg "$DEVPI_TARGET_INDEX"
-
-          set +e
-          devpi getjson /StableKite/index/sklint > "$PROJECT_JSON" 2> "$PROJECT_ERR"
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            PROJECT_JSON="$PROJECT_JSON" PACKAGE_VERSION="$PACKAGE_VERSION" python - <<'PY'
-          import json, os, re
-          from pathlib import Path
-          expected = tuple(map(int, os.environ["PACKAGE_VERSION"].split(".")))
-          data = json.loads(Path(os.environ["PROJECT_JSON"]).read_text())
-          if not isinstance(data, dict):
-              raise SystemExit("Unexpected devpi project JSON schema")
-          payload = data.get("result", data)
-          if not isinstance(payload, dict):
-              raise SystemExit("Unexpected devpi project result schema")
-          version_keys = [k for k in payload if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", str(k))]
-          if payload and not version_keys:
-              raise SystemExit("Could not identify versions in devpi project JSON")
-          versions = sorted(tuple(map(int, k.split("."))) for k in version_keys)
-          bad = [v for v in versions if v >= expected]
-          if bad:
-              raise SystemExit(f"Refusing publish; devpi already has conflicting/newer versions: {bad}")
-          print("Authenticated devpi collision check OK")
-          PY
-          else
-            cat "$PROJECT_JSON" >&2 || true
-            cat "$PROJECT_ERR" >&2 || true
-            if grep -Eqi '(^|[[:space:]])404[[:space:]]+Not Found([:[:space:]]|$)' "$PROJECT_JSON" "$PROJECT_ERR"; then
-              echo "Authenticated devpi project is not listed; release is collision-free."
-            else
-              echo "::error::Could not reliably inspect SKLint publication history on devpi."
-              exit 1
-            fi
-          fi
-
-          python -m pip install --no-deps --force-reinstall "dist/sklint-${PACKAGE_VERSION}-py3-none-manylinux_2_35_x86_64.whl"
-          python .github/scripts/ci_python_policy.py --verify
-          python -m pip check
-          python .github/scripts/ci_sklint.py smoke
-
-          devpi upload dist/*
-          devpi getjson /StableKite/index/sklint > "$AFTER_JSON"
-          AFTER_JSON="$AFTER_JSON" PACKAGE_VERSION="$PACKAGE_VERSION" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          version = os.environ["PACKAGE_VERSION"]
-          data = json.loads(Path(os.environ["AFTER_JSON"]).read_text())
-          if not isinstance(data, dict):
-              raise SystemExit("Unexpected devpi confirmation JSON schema")
-          payload = data.get("result", data)
-          if not isinstance(payload, dict) or version not in payload:
-              raise SystemExit(f"Published version {version} not confirmed by devpi")
-          print(f"devpi publication confirmed: sklint {version}")
-          PY
+        run: python -I .github/scripts/ci_publish.py upload . "${{ runner.temp }}/sklint-publication"
+      - name: Confirm exact published file names, sizes and server bytes using read credential
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          DEVPI_READ_TOKEN: ${{ secrets.DEVPI_READ_TOKEN }}
+        run: python -I .github/scripts/ci_publish.py confirm . "${{ runner.temp }}/sklint-publication"
+      - name: Preserve publication plan and original failure evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sklint-publication-receipts
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/sklint-publication/**
+            !${{ runner.temp }}/sklint-publication/consumer/**
+            !${{ runner.temp }}/sklint-publication/distributions/**
+            !${{ runner.temp }}/sklint-publication/confirmed-downloads/**
