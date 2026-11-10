@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - engineering/sk505-first-binding-v1
   workflow_dispatch:
     inputs:
       publish:
