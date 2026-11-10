@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import stat
@@ -48,13 +49,31 @@ class build_py(_build_py):
         if profile == "release":
             command.append("--release")
 
-        subprocess.run(command, cwd=ROOT, check=True)
-
-        executable_name = "sklint.exe" if os.name == "nt" else "sklint"
-        source = ROOT / "target" / profile / executable_name
+        command.append("--message-format=json-render-diagnostics")
+        output = subprocess.check_output(command, cwd=ROOT, text=True)
+        executables = set()
+        for line in output.splitlines():
+            try:
+                artifact = json.loads(line)
+            except json.JSONDecodeError:
+                print(line, file=sys.stderr)
+                continue
+            target = artifact.get("target", {})
+            if (
+                artifact.get("reason") == "compiler-artifact"
+                and target.get("name") == "sklint"
+                and target.get("kind") == ["bin"]
+                and artifact.get("executable")
+                and Path(target["src_path"]).resolve() == ROOT / "crates/sklint-cli/src/main.rs"
+            ):
+                executables.add(Path(artifact["executable"]))
+        if len(executables) != 1:
+            raise RuntimeError("Cargo did not report exactly one built SKLint executable")
+        source = executables.pop()
         if not source.is_file():
             raise RuntimeError(f"Rust build succeeded, but binary was not found: {source}")
 
+        executable_name = "sklint.exe" if os.name == "nt" else "sklint"
         destination = Path(self.build_lib) / "sklint" / "bin" / executable_name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
