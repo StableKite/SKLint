@@ -274,6 +274,18 @@ impl DataclassModel {
         class_name: &str,
         attr: &str,
     ) -> Option<ExceptionType> {
+        for name in self.proven_member_mro(class_name)? {
+            let metadata = self.exception_members.get(&name)?;
+            if let Some(ty) = metadata.members.get(attr) {
+                return ty.clone();
+            }
+        }
+        None
+    }
+
+    /// C3 order for proven bindings in the native-platform member graph.
+    /// The ordinary dataclass field/order graph remains separate.
+    fn proven_member_mro(&self, class_name: &str) -> Option<Vec<String>> {
         fn mro(
             name: &str,
             model: &DataclassModel,
@@ -317,13 +329,7 @@ impl DataclassModel {
             Some(result)
         }
         let qualified = self.qualify_current_class(class_name);
-        for name in mro(&qualified, self, &mut HashSet::new())? {
-            let metadata = self.exception_members.get(&name)?;
-            if let Some(ty) = metadata.members.get(attr) {
-                return ty.clone();
-            }
-        }
-        None
+        mro(&qualified, self, &mut HashSet::new())
     }
 
     /// Effective dataclass fields in runtime/dataclass order.
@@ -380,6 +386,18 @@ impl DataclassModel {
         let mut out = HashSet::new();
         for name in mro {
             if let Some(class) = self.all_classes.get(&name) {
+                out.extend(class.declared_attrs.iter().cloned());
+            }
+        }
+        // A platform-routed base can be absent from the ordinary dataclass
+        // import graph. Add only declarations reached through proven lexical
+        // bindings and real project-local parents. An opaque external base is
+        // a barrier; names from an inactive or unknown branch are not invented.
+        if let Some(mro) = self.proven_member_mro(class_name) {
+            for name in mro {
+                let Some(class) = self.all_classes.get(&name) else {
+                    break;
+                };
                 out.extend(class.declared_attrs.iter().cloned());
             }
         }
@@ -1650,6 +1668,63 @@ class Item:
 "#;
         let model = model(source);
         assert!(model.effective_declared_attrs("Item").contains("flag"));
+    }
+
+    #[test]
+    fn declared_fields_follow_proven_platform_parent_routes() {
+        let parent = std::env::temp_dir()
+            .canonicalize()
+            .expect("absolute temporary parent");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = parent.join(format!("sklint-platform-declared-fields-{unique}"));
+        fs::create_dir(&root).expect("create new owned fixture directory");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = true\n",
+        )
+        .unwrap();
+        fs::write(root.join("owner.py"), "class StateOwner:\n    schema_value: bool\n    def __init__(self):\n        self.schema_value = False\n").unwrap();
+        let backend = "from owner import StateOwner\nclass PlatformOwner(StateOwner):\n    pass\n";
+        for name in ["variant_a.py", "variant_b.py"] {
+            fs::write(root.join(name), backend).unwrap();
+        }
+        let child = "from route import StateProtocol\nclass Consumer(StateProtocol):\n    def activate(self):\n        self.schema_value = True\n";
+        let path = root.join("consumer.py");
+        fs::write(&path, child).unwrap();
+        let ast = PythonAst::parse(child, "consumer.py").unwrap();
+        let routes = [
+            ("import sys", "sys.platform == 'win32'"),
+            ("import os as runtime", "runtime.name == 'nt'"),
+        ];
+        for (prefix, guard) in routes {
+            let route = format!("{prefix}\nif {guard}:\n    from variant_a import PlatformOwner as Selected\nelse:\n    from variant_b import PlatformOwner as Selected\nclass StateProtocol(Selected):\n    pass\n");
+            fs::write(root.join("route.py"), &route).unwrap();
+            let model = DataclassModel::from_path(&path, child, &ast);
+            let attrs = model.effective_declared_attrs("Consumer");
+            assert!(attrs.contains("schema_value"), "{guard}");
+            assert!(!attrs.contains("unknown_field"), "{guard}");
+        }
+        let selected = if cfg!(target_os = "windows") {
+            "variant_a.py"
+        } else {
+            "variant_b.py"
+        };
+        fs::write(root.join(selected), "class PlatformOwner:\n    pass\n").unwrap();
+        let model = DataclassModel::from_path(&path, child, &ast);
+        assert!(!model
+            .effective_declared_attrs("Consumer")
+            .contains("schema_value"));
+        fs::write(root.join(selected), backend).unwrap();
+        fs::write(root.join("route.py"), "import sys\nsys = unknown_runtime\nif sys.platform == 'win32':\n    from variant_a import PlatformOwner as Selected\nelse:\n    from variant_b import PlatformOwner as Selected\nclass StateProtocol(Selected):\n    pass\n").unwrap();
+        let model = DataclassModel::from_path(&path, child, &ast);
+        assert!(!model
+            .effective_declared_attrs("Consumer")
+            .contains("schema_value"));
+        assert!(root.canonicalize().unwrap().starts_with(&parent));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
