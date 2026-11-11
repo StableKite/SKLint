@@ -194,6 +194,50 @@ class ReleaseControls(unittest.TestCase):
                         function(root, root, *extra)
                     session.assert_not_called()
 
+    def test_new_nondefault_branch_has_no_previous_commit_and_cannot_publish(self):
+        head = 'a' * 40
+        env = {'GITHUB_SHA': head, 'GITHUB_REPOSITORY': 'StableKite/SKLint',
+               'GITHUB_REF': 'refs/heads/review', 'GITHUB_EVENT_NAME': 'push',
+               'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1',
+               'NEEDS_JSON': json.dumps({name: {'result': 'success'} for name in release.PRODUCERS})}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release.write(root / 'event.json', {'repository': {'full_name': 'StableKite/SKLint',
+                          'default_branch': 'main'}, 'before': '0' * 40})
+            env.update(GITHUB_EVENT_PATH=str(root / 'event.json'), GITHUB_OUTPUT=str(root / 'output.txt'))
+            with patch.dict(os.environ, env, clear=True), patch.object(release, 'git', return_value=head), \
+                 patch.object(release, 'clean_source'), patch.object(release, 'source_version', return_value='1.3'), \
+                 patch.object(release, 'runtime_policy', return_value={'status': 'offline'}):
+                release.plan_release(root, root)
+                plan = release.read(root / 'PLAN.json')
+                self.assertIsNone(plan['previous_version'])
+                self.assertFalse(plan['should_publish'])
+                self.assertEqual(plan['reason'], 'validation-only')
+                for function, extra in [(release.collision_release, ()), (release.validate_release, (root,)),
+                                        (release.upload_release, ()), (release.confirm_release, ())]:
+                    with self.subTest(phase=function.__name__), patch('requests.Session') as session, self.assertRaises(ValueError):
+                        function(root, root, *extra)
+                    session.assert_not_called()
+
+    def test_new_default_push_still_requires_real_previous_commit(self):
+        head = 'a' * 40
+        env = {'GITHUB_SHA': head, 'GITHUB_REPOSITORY': 'StableKite/SKLint',
+               'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push',
+               'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1',
+               'NEEDS_JSON': json.dumps({name: {'result': 'success'} for name in release.PRODUCERS})}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release.write(root / 'event.json', {'repository': {'full_name': 'StableKite/SKLint',
+                          'default_branch': 'main'}, 'before': '0' * 40})
+            env.update(GITHUB_EVENT_PATH=str(root / 'event.json'), GITHUB_OUTPUT=str(root / 'output.txt'))
+            with patch.dict(os.environ, env, clear=True), patch.object(release, 'git', return_value=head), \
+                 patch.object(release, 'clean_source'), patch.object(release, 'source_version', return_value='1.3'), \
+                 patch.object(release, 'runtime_policy', return_value={'status': 'offline'}), \
+                 self.assertRaisesRegex(ValueError, 'A real previous commit is required'):
+                release.plan_release(root, root)
+            self.assertFalse((root / 'PLAN.json').exists())
+            self.assertFalse((root / 'output.txt').exists())
+
     def test_network_plan_rejects_stale_run_head_metadata_and_modified_source(self):
         head = 'a' * 40
         plan = {'should_publish': True, 'git_head': head, 'repository': 'StableKite/SKLint',

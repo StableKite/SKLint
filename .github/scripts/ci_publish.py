@@ -316,7 +316,8 @@ def plan_release(source, out):
     clean_source(source)
     default = event['repository']['default_branch']
     current = source_version(source)
-    previous = previous_version(source, event['before']) if event_name == 'push' else None
+    previous = (previous_version(source, event['before'])
+                if event_name == 'push' and ref == 'refs/heads/' + default else None)
     manual_value = event.get('inputs', {}).get('publish', 'false')
     require(manual_value in (True, False, 'true', 'false'), 'Invalid manual publish input.')
     manual = manual_value is True or manual_value == 'true'

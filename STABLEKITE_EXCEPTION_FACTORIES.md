@@ -30,4 +30,11 @@ The review workflow keeps every original platform and publication validation
 gate. Local qualification is not a completed remote matrix, default delivery
 or package-index release. Root SDK files are not modified.
 
+The first review-branch run exposed a publication-planner issue: GitHub uses
+an all-zero `before` for a newly created branch. A nondefault branch cannot
+publish, so it now records no previous version and validates without looking
+up that nonexistent commit. Default-branch pushes still require a genuine
+previous commit. Separate regression controls prove both cases and keep every
+network publication phase forbidden for validation-only plans.
+
 Reference: [Python ctypes.WinError documentation](https://docs.python.org/3.15/library/ctypes.html#ctypes.WinError).
