@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - engineering/sk505-first-binding-v1
+      - engineering/stdlib-exception-factory-v1
   workflow_dispatch:
     inputs:
       publish:
@@ -21,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  PACKAGE_VERSION: "0.1.52"
+  PACKAGE_VERSION: "0.1.53"
   PYTHON_JIT: "1"
   RUST_TOOLCHAIN: "1.98.0"
   EXPECTED_RUSTC: "rustc 1.98.0 (88d9e12ae 2026-08-18)"

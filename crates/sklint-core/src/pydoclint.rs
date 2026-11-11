@@ -8,6 +8,7 @@
 use crate::config::{EffectiveConfig, PydoclintCliOverrides};
 use crate::dataclass_model::{DataclassField, DataclassModel};
 use crate::diagnostic::{Diagnostic, Fix, Span};
+use crate::exception_factories::resolved_factory_calls;
 use crate::pydoclint_doc::{
     find_top_level_colon, is_sphinx_param_key, normalize_doc_name, normalize_type_text,
     parse_docstring, parse_docstring_with_style_detection, parse_sphinx_field,
@@ -15,8 +16,8 @@ use crate::pydoclint_doc::{
     ParsedDocstring,
 };
 use crate::python_ast::{
-    cpython_syntax_status, expression_text, function_facts, qualified_name, source_text,
-    string_constant, suite_docstring, suite_docstring_stmt, FunctionFacts, PythonAst,
+    cpython_syntax_status, expression_text, function_facts_with_resolved_raises, qualified_name,
+    source_text, string_constant, suite_docstring, suite_docstring_stmt, FunctionFacts, PythonAst,
     SyntaxOracleStatus,
 };
 use rustpython_parser::ast::{self, Constant, Expr, Stmt};
@@ -345,6 +346,7 @@ struct Visitor<'a> {
     config: &'a EffectiveConfig,
     options: PydoclintOptions,
     dataclasses: DataclassModel,
+    exception_factory_calls: HashMap<usize, String>,
     allow_structural_fixes: bool,
     diagnostics: Vec<Diagnostic>,
 }
@@ -432,6 +434,7 @@ fn run_pydoclint_rules_with_syntax_oracle(
             config.pydoclint_config_path.as_deref(),
             &config.pydoclint_overrides,
         ),
+        exception_factory_calls: resolved_factory_calls(&ast),
         dataclasses,
         allow_structural_fixes: sanitized_source.is_none(),
         diagnostics: Vec::new(),
@@ -611,7 +614,8 @@ impl<'a> Visitor<'a> {
         self.check_arguments(function, parent, &doc);
 
         if !doc.style_mismatch {
-            let mut facts = function_facts(function.body());
+            let mut facts =
+                function_facts_with_resolved_raises(function.body(), &self.exception_factory_calls);
             // pydoclint 0.9.1 intentionally recognizes only statement-form
             // `yield` / `yield from` (an `ast.Expr` wrapping Yield/YieldFrom).
             // Keep the shared AST facts Python-correct for other SKLint rules,
@@ -4530,6 +4534,193 @@ mod tests {
             .into_iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    fn factory_codes(
+        imports: &str,
+        parameters: &str,
+        setup: &str,
+        call: &str,
+        exception: &str,
+    ) -> Vec<String> {
+        let source = format!("{imports}\ndef fail({parameters}):\n    \"\"\"Build and raise an error.\n\n    Raises:\n        {exception}: The error.\n    \"\"\"\n{setup}    raise {call}\n");
+        codes_with_options(
+            &source,
+            "style = 'google'\nskip-checking-short-docstrings = false",
+        )
+    }
+
+    #[test]
+    fn stdlib_exception_factory_imports_aliases_and_local_imports() {
+        for (imports, setup, call) in [
+            ("from ctypes import WinError", "", "WinError(5)"),
+            (
+                "from ctypes import WinError as make_error",
+                "",
+                "make_error(5)",
+            ),
+            ("import ctypes", "", "ctypes.WinError(5)"),
+            ("import ctypes as native", "", "native.WinError(5)"),
+            (
+                "import ctypes\nmake_error = ctypes.WinError",
+                "",
+                "make_error(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "    make_error = WinError\n",
+                "make_error(5)",
+            ),
+            (
+                "",
+                "    from ctypes import WinError as make_error\n",
+                "make_error(5)",
+            ),
+        ] {
+            let actual = factory_codes(imports, "", setup, call, "OSError");
+            assert!(
+                !actual.contains(&"SKD503".to_string()),
+                "{imports};{setup};{call}: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdlib_exception_factory_shadowed_and_unrelated_names_remain_errors() {
+        for (imports, parameters, setup, call) in [
+            ("", "", "", "WinError(5)"),
+            ("from other import WinError", "", "", "WinError(5)"),
+            ("from .ctypes import WinError", "", "", "WinError(5)"),
+            ("from ctypes import WinError", "WinError", "", "WinError(5)"),
+            (
+                "from ctypes import WinError",
+                "",
+                "    WinError = ValueError\n",
+                "WinError(5)",
+            ),
+            (
+                "from ctypes import WinError\nWinError = ValueError",
+                "",
+                "",
+                "WinError(5)",
+            ),
+            (
+                "import ctypes as native\nnative = other",
+                "",
+                "",
+                "native.WinError(5)",
+            ),
+            (
+                "import ctypes as native",
+                "native",
+                "",
+                "native.WinError(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "",
+                "    for WinError in values:\n        pass\n",
+                "WinError(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "",
+                "    with manager() as WinError:\n        pass\n",
+                "WinError(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "",
+                "    try:\n        action()\n    except Exception as WinError:\n        pass\n",
+                "WinError(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "",
+                "    if (WinError := ValueError):\n        pass\n",
+                "WinError(5)",
+            ),
+            (
+                "from ctypes import WinError",
+                "",
+                "    match value:\n        case {\"factory\": WinError}:\n            pass\n",
+                "WinError(5)",
+            ),
+            (
+                "import ctypes\nctypes.WinError = other",
+                "",
+                "",
+                "ctypes.WinError(5)",
+            ),
+            (
+                "import ctypes as native\nsecond = native\nsecond.WinError = other",
+                "",
+                "",
+                "native.WinError(5)",
+            ),
+            ("from ctypes import WinError", "", "", "WinError"),
+        ] {
+            let actual = factory_codes(imports, parameters, setup, call, "OSError");
+            assert!(
+                actual.contains(&"SKD503".to_string()),
+                "{imports};{parameters};{setup};{call}: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdlib_exception_factory_keeps_wrong_docs_and_missing_raises_diagnostics() {
+        assert!(factory_codes(
+            "from ctypes import WinError",
+            "",
+            "",
+            "WinError(5)",
+            "ValueError"
+        )
+        .contains(&"SKD503".to_string()));
+        let source = "from ctypes import WinError\ndef fail():\n    \"\"\"Build an error.\n\n    This function raises an exception.\n    \"\"\"\n    raise WinError(5)\n";
+        let actual = codes_with_options(
+            source,
+            "style = 'google'\nskip-checking-short-docstrings = false",
+        );
+        assert!(actual.contains(&"SKD501".to_string()));
+    }
+
+    #[test]
+    fn stdlib_exception_factory_closures_class_scope_and_async_functions() {
+        for (source, mismatch) in [
+            ("import ctypes\nclass Holder:\n    ctypes = other\n    def fail(self):\n        \"\"\"Raise an error.\n\n        Raises:\n            OSError: The error.\n        \"\"\"\n        raise ctypes.WinError(5)\n", false),
+            ("def outer():\n    from ctypes import WinError as build_error\n    def fail():\n        \"\"\"Raise an error.\n\n        Raises:\n            OSError: The error.\n        \"\"\"\n        raise build_error(5)\n", false),
+            ("class Holder:\n    from ctypes import WinError\n    def fail(self):\n        \"\"\"Raise an error.\n\n        Raises:\n            OSError: The error.\n        \"\"\"\n        raise WinError(5)\n", true),
+            ("from ctypes import WinError\nasync def fail():\n    \"\"\"Raise an error.\n\n    Raises:\n        OSError: The error.\n    \"\"\"\n    raise WinError(5)\n", false),
+            ("from ctypes import WinError\ndef fail():\n    \"\"\"Raise an error.\n\n    Raises:\n        OSError: The error.\n    \"\"\"\n    raise WinError(5)\nWinError = ValueError\n", true),
+        ] {
+            let actual = codes_with_options(source, "style = 'google'\nskip-checking-short-docstrings = false");
+            assert_eq!(actual.contains(&"SKD503".to_string()), mismatch, "{source}: {actual:?}");
+        }
+    }
+
+    #[test]
+    fn stdlib_exception_factory_readonly_declarations_and_comprehensions() {
+        for setup in [
+            "    global WinError\n",
+            "    values = [WinError for WinError in range(2)]\n",
+        ] {
+            assert!(!factory_codes(
+                "from ctypes import WinError",
+                "",
+                setup,
+                "WinError(5)",
+                "OSError"
+            )
+            .contains(&"SKD503".to_string()));
+        }
+        let source = "def outer():\n    from ctypes import WinError\n    def fail():\n        \"\"\"Raise an error.\n\n        Raises:\n            OSError: The error.\n        \"\"\"\n        nonlocal WinError\n        raise WinError(5)\n";
+        assert!(!codes_with_options(
+            source,
+            "style = 'google'\nskip-checking-short-docstrings = false"
+        )
+        .contains(&"SKD503".to_string()));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod diagnostic;
 pub mod docstring_presence;
 pub mod docstrings;
 pub mod dynamic_attrs;
+mod exception_factories;
 pub mod formatter;
 mod identifier;
 pub mod magic_constants;

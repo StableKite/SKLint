@@ -754,17 +754,50 @@ pub fn suite_docstring_stmt(body: &[Stmt]) -> Option<&Stmt> {
 /// distinction that text/indentation heuristics cannot model reliably and is
 /// required for pydoclint parity around return/yield/raise checks.
 pub fn function_facts(body: &[Stmt]) -> FunctionFacts {
+    function_facts_with_resolved_raises(body, &HashMap::new())
+}
+
+/// Preserve ordinary control-flow facts while refining proven factory calls.
+pub fn function_facts_with_resolved_raises(
+    body: &[Stmt],
+    resolved_calls: &HashMap<usize, String>,
+) -> FunctionFacts {
     let mut facts = FunctionFacts::default();
-    let mut raised = BTreeSet::new();
+    let mut raised = RaisedExceptions {
+        names: BTreeSet::new(),
+        resolved_calls,
+    };
     walk_statements(body, &mut facts, &mut raised, None);
-    facts.raised_exceptions = raised.into_iter().collect();
+    facts.raised_exceptions = raised.names.into_iter().collect();
     facts
+}
+
+struct RaisedExceptions<'a> {
+    names: BTreeSet<String>,
+    resolved_calls: &'a HashMap<usize, String>,
+}
+
+impl RaisedExceptions<'_> {
+    fn insert(&mut self, name: String) {
+        self.names.insert(name);
+    }
+    fn extend(&mut self, names: impl IntoIterator<Item = String>) {
+        self.names.extend(names);
+    }
+    fn resolve(&self, expr: &Expr, context: Option<&ExceptContext>) -> Option<String> {
+        if matches!(expr, Expr::Call(_)) {
+            if let Some(name) = self.resolved_calls.get(&text_size_to_usize(expr.start())) {
+                return Some(name.clone());
+            }
+        }
+        raised_exception_name(expr, context)
+    }
 }
 
 fn walk_statements(
     body: &[Stmt],
     facts: &mut FunctionFacts,
-    raised: &mut BTreeSet<String>,
+    raised: &mut RaisedExceptions<'_>,
     active_except: Option<&ExceptContext>,
 ) {
     for stmt in body {
@@ -789,13 +822,13 @@ fn walk_statements(
                         if let Some(context) = active_except {
                             if context.binding.as_deref() == Some(name.id.as_str()) {
                                 raised.extend(context.types.iter().cloned());
-                            } else if let Some(name) = raised_exception_name(exc, active_except) {
+                            } else if let Some(name) = raised.resolve(exc, active_except) {
                                 raised.insert(name);
                             }
-                        } else if let Some(name) = raised_exception_name(exc, active_except) {
+                        } else if let Some(name) = raised.resolve(exc, active_except) {
                             raised.insert(name);
                         }
-                    } else if let Some(name) = raised_exception_name(exc, active_except) {
+                    } else if let Some(name) = raised.resolve(exc, active_except) {
                         raised.insert(name);
                     }
                     walk_expr(exc, facts);
@@ -919,7 +952,7 @@ fn walk_statements(
 fn walk_except_handler(
     handler: &ast::ExceptHandler,
     facts: &mut FunctionFacts,
-    raised: &mut BTreeSet<String>,
+    raised: &mut RaisedExceptions<'_>,
 ) {
     let ast::ExceptHandler::ExceptHandler(node) = handler;
     let context = ExceptContext {

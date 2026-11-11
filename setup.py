@@ -100,7 +100,7 @@ class build_py(_build_py):
         build_info.write_text(
             "\n".join(
                 [
-                    f"version={os.environ.get('SKLINT_BUILD_VERSION', '0.1.52')}",
+                    f"version={os.environ.get('SKLINT_BUILD_VERSION', '0.1.53')}",
                     f"revision={os.environ.get('SKLINT_BUILD_REVISION', 'development')}",
                     f"source_tree_sha256={os.environ.get('SKLINT_SOURCE_TREE_SHA256', 'unknown')}",
                     f"source_commit={os.environ.get('SKLINT_SOURCE_COMMIT', 'unknown')}",
