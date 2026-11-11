@@ -23,6 +23,7 @@ def main() -> int:
         return 2
 
     argv = [str(binary), *sys.argv[1:]]
+    os.environ.setdefault("SKLINT_PYTHON", sys.executable)
     if os.name == "nt":
         completed = subprocess.run(argv)
         return int(completed.returncode)

@@ -636,6 +636,39 @@ multiline = """
     }
 
     #[test]
+    fn pep810_full_ast_keeps_numeric_negative_for_both_import_forms() {
+        for import in [
+            "from collections.abc import Callable",
+            "import collections.abc",
+        ] {
+            for prefix in ["", "lazy "] {
+                for (value, expected) in [("_RESULT", 0), ("41", 1)] {
+                    let source = format!("# sklint: strict\n{prefix}{import}\n__all__ = (\"invoke\",)\n_RESULT = 37\ndef invoke(callback) -> int:\n    callback()\n    return int({value})\n");
+                    let report = analyze(input(&source));
+                    assert!(
+                        !report
+                            .diagnostics
+                            .iter()
+                            .any(|d| matches!(d.code.as_str(), "SK902" | "SK903")),
+                        "{source}: {:?}",
+                        report.diagnostics
+                    );
+                    let numeric: Vec<_> = report
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.code == "SK901")
+                        .collect();
+                    assert_eq!(numeric.len(), expected, "{source}");
+                    if expected != 0 {
+                        assert_eq!(numeric[0].line, 7);
+                        assert_eq!(numeric[0].column, 16);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn triple_nested_pep701_keeps_file_level_ast_rules_active() {
         let report = analyze(input(
             r#"# sklint: strict

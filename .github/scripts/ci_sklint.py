@@ -139,6 +139,73 @@ def verify_publish_set(directory: Path) -> None:
     print("SKLint exact publish set: PASS")
 
 
+def smoke_python315() -> None:
+    if sys.version_info < (3, 15):
+        return
+    import tempfile
+
+    template = '''"""Проверка числового результата обработчика"""
+{modifier}from collections.abc import Callable
+
+__all__ = ("invoke",)
+
+_RESULT = 37
+"""Ожидаемый результат обработчика"""
+
+def invoke(callback: Callable[[], None]) -> int:
+    """
+    Вызов обработчика и возврат фиксированного результата
+
+    Args:
+        callback (Callable[[], None]): Обработчик для одного вызова
+    Returns:
+        int: Фиксированный результат после вызова обработчика
+    """
+
+    callback()
+    return int({value})
+'''
+    with tempfile.TemporaryDirectory(prefix="sklint-python315-") as temporary:
+        root = Path(temporary)
+        (root / "pyproject.toml").write_bytes(b"[tool.sklint]\nstrict = true\n")
+        for modifier in ("", "lazy "):
+            for value in ("_RESULT", "41"):
+                path = root / "sample.py"
+                source = template.format(modifier=modifier, value=value).rstrip("\n")
+                compile(source, str(path), "exec")
+                path.write_bytes(source.encode("utf-8"))
+                checked = subprocess.run(
+                    [sys.executable, "-m", "sklint", "check", "--format", "json", str(path)],
+                    capture_output=True, text=True,
+                )
+                diagnostics = json.loads(checked.stdout)["diagnostics"]
+                expected = [] if value == "_RESULT" else ["SK901"]
+                if [entry["code"] for entry in diagnostics] != expected:
+                    raise SystemExit(f"PEP 810 full AST/control mismatch: {diagnostics}")
+                if checked.returncode != int(value == "41"):
+                    raise SystemExit("PEP 810 installed CLI returned the wrong status")
+        path = root / "template.py"
+        source = 'name = "actual"\nvalue = t"{name}"\n'
+        compile(source, str(path), "exec")
+        path.write_bytes(source.encode("utf-8"))
+        env = dict(os.environ, PATH="")
+        env.pop("SKLINT_PYTHON", None)
+        for explicit_missing in (False, True):
+            if explicit_missing:
+                missing = root / "not-created-python"
+                assert not missing.exists()
+                env["SKLINT_PYTHON"] = str(missing)
+            checked = subprocess.run(
+                [sys.executable, "-m", "sklint", "check", "--format", "json", str(path)],
+                env=env, capture_output=True, text=True,
+            )
+            codes = {entry["code"] for entry in json.loads(checked.stdout)["diagnostics"]}
+            expected, absent = ("SK903", "SK902") if explicit_missing else ("SK902", "SK903")
+            if expected not in codes or absent in codes or checked.returncode != 1:
+                raise SystemExit(f"Real interpreter/default-or-explicit oracle mismatch: {codes}")
+    print("SKLint installed Python 3.15 AST and real interpreter oracle: PASS")
+
+
 def smoke() -> None:
     version = canonical_version()
     exe = Path(sys.executable).with_name("sklint.exe" if os.name == "nt" else "sklint")
@@ -153,6 +220,7 @@ def smoke() -> None:
     verbose = subprocess.check_output([str(exe), "--version", "--verbose"], text=True)
     if f"sklint {version}" not in verbose:
         raise SystemExit("Installed binary reports wrong version")
+    smoke_python315()
     print("SKLint installed-package smoke: PASS")
 
 

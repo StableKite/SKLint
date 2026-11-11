@@ -18,6 +18,7 @@ mod exception_values;
 pub mod formatter;
 mod identifier;
 pub mod magic_constants;
+mod pep810;
 pub mod pydoclint;
 pub mod pydoclint_doc;
 pub mod python_ast;

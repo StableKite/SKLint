@@ -17,10 +17,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub type Suite = ast::Suite;
+pub use crate::pep810::LazyImport;
 
 #[derive(Debug, Clone)]
 pub struct PythonAst {
     pub suite: Suite,
+    pub lazy_imports: Vec<LazyImport>,
     line_starts: Vec<usize>,
 }
 
@@ -64,20 +66,32 @@ struct ExceptContext {
 
 impl PythonAst {
     pub fn parse(source: &str, filename: &str) -> Result<Self, ParseError> {
-        let suite = match Suite::parse(source, filename) {
-            Ok(suite) => suite,
+        let (suite, lazy_imports) = match Suite::parse(source, filename) {
+            Ok(suite) => (suite, Vec::new()),
             Err(original_error) => {
+                if let Some(parsed) = crate::pep810::parse(source, filename) {
+                    let (suite, lazy_imports) = parsed?;
+                    return Ok(Self {
+                        suite,
+                        lazy_imports,
+                        line_starts: line_starts(source),
+                    });
+                }
                 let Some(compat) = rewrite_modern_python_for_embedded_parser(source) else {
                     return Err(original_error);
                 };
                 match Suite::parse(&compat, filename) {
-                    Ok(suite) => suite,
-                    Err(_) => return Err(original_error),
+                    Ok(suite) => (suite, Vec::new()),
+                    Err(_) => match crate::pep810::parse(&compat, filename) {
+                        Some(parsed) => parsed?,
+                        None => return Err(original_error),
+                    },
                 }
             }
         };
         Ok(Self {
             suite,
+            lazy_imports,
             // The compatibility rewrite is byte-for-byte length preserving, so
             // AST byte ranges map back to the original source exactly.
             line_starts: line_starts(source),
@@ -102,6 +116,12 @@ impl PythonAst {
 
     pub fn end_location_of<T: Ranged>(&self, node: &T) -> SourceLocation {
         self.location_of_offset(text_size_to_usize(node.end()))
+    }
+
+    pub fn is_lazy_import<T: Ranged>(&self, node: &T) -> bool {
+        self.lazy_imports
+            .iter()
+            .any(|import| import.range.start() == node.start() && import.range.end() == node.end())
     }
 }
 
@@ -140,7 +160,7 @@ pub fn cpython_syntax_status(source: &str) -> SyntaxOracleStatus {
     // infrastructure/version mismatch, not proof that the user's source is
     // invalid. Exit 86 is reserved for that state and maps to `Unavailable`.
     const ORACLE_TOO_OLD_EXIT: i32 = 86;
-    const SCRIPT: &str = "import ast,sys,pathlib; sys.exit(86) if sys.version_info < (3,13) else ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))";
+    const SCRIPT: &str = "import sys,pathlib; sys.exit(86) if sys.version_info < (3,13) else compile(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'),sys.argv[1],'exec',dont_inherit=True)";
     let path_arg = temp_path.to_string_lossy().into_owned();
     let candidates = if let Some(program) = interpreter_override.as_ref() {
         vec![(
