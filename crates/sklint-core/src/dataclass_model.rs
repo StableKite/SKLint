@@ -5,6 +5,10 @@
 //! local imports are followed lazily so inherited fields and transform markers
 //! work across modules and re-exports.
 
+use crate::exception_values::{
+    active_module_statements, annotation_scope, builtin_base, class_members, ExceptionType,
+    MemberTypes,
+};
 use crate::python_ast::{qualified_name, string_constant, PythonAst};
 use rustpython_parser::ast::{Expr, Stmt};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
@@ -40,6 +44,14 @@ pub struct DataclassModel {
     pub classes: Vec<DataclassClass>,
     all_classes: HashMap<String, DataclassClass>,
     current_module: String,
+    exception_members: HashMap<String, ExceptionMembers>,
+}
+
+#[derive(Debug, Clone)]
+struct ExceptionMembers {
+    bases_proven: bool,
+    bases: Vec<String>,
+    members: MemberTypes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,12 +70,15 @@ struct RawClass {
     direct_fields: Vec<DataclassField>,
     declared_attrs: HashSet<String>,
     is_transform_provider: bool,
+    exception_members: (bool, MemberTypes),
+    exception_bases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct RawModule {
     name: String,
     imports: Imports,
+    exception_imports: Imports,
     classes: Vec<RawClass>,
     transform_providers: HashSet<String>,
 }
@@ -82,25 +97,11 @@ impl DataclassModel {
     /// third-party modules that are not present under the project root are not
     /// imported/executed; their names remain symbolic.
     pub fn from_path(path: &Path, source: &str, ast: &PythonAst) -> Self {
-        static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64), DataclassModel>>> = OnceLock::new();
-
-        let mut hasher = DefaultHasher::new();
-        source.hash(&mut hasher);
-        let source_hash = hasher.finish();
-        let cache_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let cache_key = (cache_path, source_hash);
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(guard) = cache.lock() {
-            if let Some(model) = guard.get(&cache_key) {
-                return model.clone();
-            }
-        }
-
-        let model = Self::from_path_uncached(path, source, ast);
-        if let Ok(mut guard) = cache.lock() {
-            guard.insert(cache_key, model.clone());
-        }
-        model
+        // A complete model depends on imported modules, not just this source
+        // buffer. Re-resolve its graph so changed/new/deleted parents cannot
+        // leave stale member types behind. Parsed imported modules remain
+        // cached by their own current content hash in load_raw_module_cached.
+        Self::from_path_uncached(path, source, ast)
     }
 
     fn from_path_uncached(path: &Path, source: &str, ast: &PythonAst) -> Self {
@@ -146,6 +147,15 @@ impl DataclassModel {
                             &mut requested,
                         );
                     }
+                    if let Some(target) = raw.exception_imports.aliases.get(local) {
+                        queue_symbol_reference(
+                            &root,
+                            target,
+                            &mut queued,
+                            &mut queue,
+                            &mut requested,
+                        );
+                    }
                 }
             }
 
@@ -161,6 +171,10 @@ impl DataclassModel {
             .iter()
             .map(|module| (module.name.clone(), module.imports.clone()))
             .collect::<HashMap<_, _>>();
+        let exception_imports = modules
+            .iter()
+            .map(|module| (module.name.clone(), module.exception_imports.clone()))
+            .collect::<HashMap<_, _>>();
 
         // Resolve re-export chains after all reachable modules are known.
         for module in &mut modules {
@@ -169,6 +183,11 @@ impl DataclassModel {
                     .bases
                     .iter()
                     .map(|name| resolve_project_symbol(name, &module_imports))
+                    .collect();
+                class.exception_bases = class
+                    .exception_bases
+                    .iter()
+                    .map(|name| resolve_project_symbol(name, &exception_imports))
                     .collect();
                 class.decorators = class
                     .decorators
@@ -222,6 +241,19 @@ impl DataclassModel {
             classes,
             all_classes: computed,
             current_module: current_module.to_string(),
+            exception_members: raw_classes
+                .iter()
+                .map(|class| {
+                    (
+                        class.qualified_name.clone(),
+                        ExceptionMembers {
+                            bases_proven: class.exception_members.0,
+                            members: class.exception_members.1.clone(),
+                            bases: class.exception_bases.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -232,6 +264,66 @@ impl DataclassModel {
                 .iter()
                 .find(|class| class.name == name || class.qualified_name == name)
         })
+    }
+
+    /// Find a proven exception-valued property using Python's complete C3 MRO.
+    /// Unknown bases remain opaque barriers, and any explicit untyped override
+    /// stops lookup instead of falling through to a convenient ancestor.
+    pub(crate) fn exception_member_type(
+        &self,
+        class_name: &str,
+        attr: &str,
+    ) -> Option<ExceptionType> {
+        fn mro(
+            name: &str,
+            model: &DataclassModel,
+            visiting: &mut HashSet<String>,
+        ) -> Option<Vec<String>> {
+            if !visiting.insert(name.to_string()) {
+                return None;
+            }
+            let Some(_) = model.all_classes.get(name) else {
+                visiting.remove(name);
+                return Some(vec![name.to_string()]);
+            };
+            let metadata = model.exception_members.get(name)?;
+            if !metadata.bases_proven || metadata.members.contains_key("<unproven-class-binding>") {
+                return None;
+            }
+            let mut sequences = metadata
+                .bases
+                .iter()
+                .map(|base| mro(base, model, visiting))
+                .collect::<Option<Vec<_>>>()?;
+            sequences.push(metadata.bases.clone());
+            let mut result = vec![name.to_string()];
+            while sequences.iter().any(|sequence| !sequence.is_empty()) {
+                sequences.retain(|sequence| !sequence.is_empty());
+                let candidate = sequences.iter().find_map(|sequence| {
+                    let head = &sequence[0];
+                    (!sequences
+                        .iter()
+                        .any(|other| other.iter().skip(1).any(|item| item == head)))
+                    .then(|| head.clone())
+                })?;
+                result.push(candidate.clone());
+                for sequence in &mut sequences {
+                    if sequence.first() == Some(&candidate) {
+                        sequence.remove(0);
+                    }
+                }
+            }
+            visiting.remove(name);
+            Some(result)
+        }
+        let qualified = self.qualify_current_class(class_name);
+        for name in mro(&qualified, self, &mut HashSet::new())? {
+            let metadata = self.exception_members.get(&name)?;
+            if let Some(ty) = metadata.members.get(attr) {
+                return ty.clone();
+            }
+        }
+        None
     }
 
     /// Effective dataclass fields in runtime/dataclass order.
@@ -472,6 +564,8 @@ fn raw_module_from_ast(
     is_package: bool,
 ) -> RawModule {
     let imports = Imports::from_suite(&ast.suite, module_name, is_package);
+    let active = active_module_statements(&ast.suite);
+    let exception_imports = Imports::from_suite(&active, module_name, is_package);
     let mut transform_providers = HashSet::new();
 
     for stmt in &ast.suite {
@@ -491,6 +585,7 @@ fn raw_module_from_ast(
     }
 
     let mut classes = Vec::new();
+    let exception_scope = annotation_scope(&active);
     for stmt in &ast.suite {
         let Stmt::ClassDef(class) = stmt else {
             continue;
@@ -504,6 +599,15 @@ fn raw_module_from_ast(
             .filter_map(class_base_name)
             .map(|name| imports.resolve_symbol(&name, module_name))
             .collect::<Vec<_>>();
+        let exception_bases = class
+            .bases
+            .iter()
+            .filter_map(class_base_name)
+            .map(|name| {
+                builtin_base(&exception_scope, &name)
+                    .unwrap_or_else(|| exception_imports.resolve_symbol(&name, module_name))
+            })
+            .collect();
         let decorators = class
             .decorator_list
             .iter()
@@ -535,12 +639,15 @@ fn raw_module_from_ast(
             direct_fields,
             declared_attrs,
             is_transform_provider: transform_providers.contains(&provider_name),
+            exception_members: class_members(&exception_scope, class),
+            exception_bases,
         });
     }
 
     RawModule {
         name: module_name.to_string(),
         imports,
+        exception_imports,
         classes,
         transform_providers,
     }
@@ -666,6 +773,9 @@ fn queue_semantic_references(
 ) {
     for class in &module.classes {
         for symbol in &class.bases {
+            queue_symbol_reference(root, symbol, queued, queue, requested);
+        }
+        for symbol in &class.exception_bases {
             queue_symbol_reference(root, symbol, queued, queue, requested);
         }
         for symbol in &class.decorators {
@@ -1374,6 +1484,74 @@ class Child(api.Parent):
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exception_property_lookup_obeys_c3_and_explicit_unknown_overrides() {
+        let source = "class Grand:\n    @property\n    def failure(self) -> OSError | None:\n        return self._failure\nclass First(Grand):\n    pass\nclass Override(Grand):\n    @property\n    def failure(this) -> ValueError | None:\n        return this._failure\nclass Child(First, Override):\n    pass\nclass Shadow(Child):\n    failure = unknown\nclass Unresolved(External, Grand):\n    pass\n";
+        let model = model(source);
+        assert_eq!(
+            model.exception_member_type("Child", "failure"),
+            Some(ExceptionType {
+                names: vec!["ValueError".to_string()],
+                nullable: true
+            })
+        );
+        assert_eq!(model.exception_member_type("Shadow", "failure"), None);
+        assert_eq!(model.exception_member_type("Unresolved", "failure"), None);
+    }
+
+    #[test]
+    fn exception_property_imported_reexports_refresh_when_parent_changes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sklint-exception-members-{unique}"));
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).expect("package");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = true\n",
+        )
+        .expect("project");
+        fs::write(pkg.join("__init__.py"), "").expect("init");
+        fs::write(
+            pkg.join("api.py"),
+            "from .parent import Parent as Exported\n",
+        )
+        .expect("reexport");
+        let parent = pkg.join("parent.py");
+        fs::write(&parent, "class Parent:\n    @property\n    def failure(self) -> OSError | None:\n        return self._failure\n").expect("parent");
+        let child_path = pkg.join("child.py");
+        let child = "import pkg.api as api\nclass Child(api.Exported):\n    pass\n";
+        fs::write(&child_path, child).expect("child");
+        let ast = PythonAst::parse(child, &child_path.display().to_string()).expect("parse");
+        let first = DataclassModel::from_path(&child_path, child, &ast);
+        assert_eq!(
+            first.exception_member_type("Child", "failure"),
+            Some(ExceptionType {
+                names: vec!["OSError".to_string()],
+                nullable: true
+            })
+        );
+        fs::write(&parent, "class Parent:\n    @property\n    def failure(self) -> RuntimeError | None:\n        return self._failure\n").expect("changed parent");
+        let changed = DataclassModel::from_path(&child_path, child, &ast);
+        assert_eq!(
+            changed.exception_member_type("Child", "failure"),
+            Some(ExceptionType {
+                names: vec!["RuntimeError".to_string()],
+                nullable: true
+            })
+        );
+        let resolved = root.canonicalize().expect("resolved own test directory");
+        assert!(resolved.starts_with(std::env::temp_dir().canonicalize().expect("temp root")));
+        assert!(resolved
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .starts_with("sklint-exception-members-"));
+        fs::remove_dir_all(resolved).expect("remove verified own test directory");
     }
 
     #[test]

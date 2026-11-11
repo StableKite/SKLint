@@ -51,6 +51,9 @@ pub struct FunctionFacts {
     /// without pretending that every call is statically understood.
     pub has_call: bool,
     pub raised_exceptions: Vec<String>,
+    /// Proven value types are kept separate from unresolved variable names so
+    /// an unrelated parameter with the same spelling cannot re-interpret them.
+    pub resolved_exception_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -762,19 +765,32 @@ pub fn function_facts_with_resolved_raises(
     body: &[Stmt],
     resolved_calls: &HashMap<usize, String>,
 ) -> FunctionFacts {
+    function_facts_with_exception_values(body, resolved_calls, &HashMap::new())
+}
+
+pub(crate) fn function_facts_with_exception_values(
+    body: &[Stmt],
+    resolved_calls: &HashMap<usize, String>,
+    resolved_values: &HashMap<usize, Vec<String>>,
+) -> FunctionFacts {
     let mut facts = FunctionFacts::default();
     let mut raised = RaisedExceptions {
         names: BTreeSet::new(),
         resolved_calls,
+        resolved_values,
+        proven_types: BTreeSet::new(),
     };
     walk_statements(body, &mut facts, &mut raised, None);
     facts.raised_exceptions = raised.names.into_iter().collect();
+    facts.resolved_exception_types = raised.proven_types.into_iter().collect();
     facts
 }
 
 struct RaisedExceptions<'a> {
     names: BTreeSet<String>,
     resolved_calls: &'a HashMap<usize, String>,
+    resolved_values: &'a HashMap<usize, Vec<String>>,
+    proven_types: BTreeSet<String>,
 }
 
 impl RaisedExceptions<'_> {
@@ -818,7 +834,11 @@ fn walk_statements(
             Stmt::Raise(node) => {
                 facts.has_raise = true;
                 if let Some(exc) = &node.exc {
-                    if let Expr::Name(name) = exc.as_ref() {
+                    if let Some(types) =
+                        raised.resolved_values.get(&text_size_to_usize(exc.start()))
+                    {
+                        raised.proven_types.extend(types.iter().cloned());
+                    } else if let Expr::Name(name) = exc.as_ref() {
                         if let Some(context) = active_except {
                             if context.binding.as_deref() == Some(name.id.as_str()) {
                                 raised.extend(context.types.iter().cloned());

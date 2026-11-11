@@ -9,6 +9,10 @@ use crate::config::{EffectiveConfig, PydoclintCliOverrides};
 use crate::dataclass_model::{DataclassField, DataclassModel};
 use crate::diagnostic::{Diagnostic, Fix, Span};
 use crate::exception_factories::resolved_factory_calls;
+use crate::exception_values::{
+    annotation_scope, canonical_builtin_exception, resolved_exception_values,
+    Scope as ExceptionScope,
+};
 use crate::pydoclint_doc::{
     find_top_level_colon, is_sphinx_param_key, normalize_doc_name, normalize_type_text,
     parse_docstring, parse_docstring_with_style_detection, parse_sphinx_field,
@@ -16,7 +20,7 @@ use crate::pydoclint_doc::{
     ParsedDocstring,
 };
 use crate::python_ast::{
-    cpython_syntax_status, expression_text, function_facts_with_resolved_raises, qualified_name,
+    cpython_syntax_status, expression_text, function_facts_with_exception_values, qualified_name,
     source_text, string_constant, suite_docstring, suite_docstring_stmt, FunctionFacts, PythonAst,
     SyntaxOracleStatus,
 };
@@ -347,6 +351,7 @@ struct Visitor<'a> {
     options: PydoclintOptions,
     dataclasses: DataclassModel,
     exception_factory_calls: HashMap<usize, String>,
+    exception_scope: ExceptionScope,
     allow_structural_fixes: bool,
     diagnostics: Vec<Diagnostic>,
 }
@@ -435,6 +440,7 @@ fn run_pydoclint_rules_with_syntax_oracle(
             &config.pydoclint_overrides,
         ),
         exception_factory_calls: resolved_factory_calls(&ast),
+        exception_scope: annotation_scope(&ast.suite),
         dataclasses,
         allow_structural_fixes: sanitized_source.is_none(),
         diagnostics: Vec::new(),
@@ -614,8 +620,24 @@ impl<'a> Visitor<'a> {
         self.check_arguments(function, parent, &doc);
 
         if !doc.style_mismatch {
-            let mut facts =
-                function_facts_with_resolved_raises(function.body(), &self.exception_factory_calls);
+            let instance_class = match parent {
+                ParentDef::Class(class) if function.decorators().is_empty() => {
+                    Some(class.name.as_str())
+                }
+                _ => None,
+            };
+            let values = resolved_exception_values(
+                &self.exception_scope,
+                &self.dataclasses,
+                function.args(),
+                function.body(),
+                instance_class,
+            );
+            let mut facts = function_facts_with_exception_values(
+                function.body(),
+                &self.exception_factory_calls,
+                &values,
+            );
             // pydoclint 0.9.1 intentionally recognizes only statement-form
             // `yield` / `yield from` (an `ast.Expr` wrapping Yield/YieldFrom).
             // Keep the shared AST facts Python-correct for other SKLint rules,
@@ -1217,6 +1239,7 @@ impl<'a> Visitor<'a> {
         let prefix = function_prefix(function, parent);
         if facts.has_raise && !doc.parsed.has_raises_section {
             let mut exceptions = facts.raised_exceptions.clone();
+            exceptions.extend(facts.resolved_exception_types.iter().cloned());
             if self
                 .options
                 .should_declare_assert_error_if_assert_statement_exists
@@ -1320,6 +1343,7 @@ impl<'a> Visitor<'a> {
                     name.clone()
                 })
                 .collect::<Vec<_>>();
+            actual.extend(facts.resolved_exception_types.iter().cloned());
             if self
                 .options
                 .should_declare_assert_error_if_assert_statement_exists
@@ -1330,6 +1354,17 @@ impl<'a> Visitor<'a> {
             actual.sort();
             actual.dedup();
             let mut documented = doc.parsed.raises.clone();
+            if !facts.resolved_exception_types.is_empty() {
+                for name in actual.iter_mut().chain(documented.iter_mut()) {
+                    if let Some(canonical) =
+                        canonical_builtin_exception(&self.exception_scope, name)
+                    {
+                        *name = canonical;
+                    }
+                }
+                actual.sort();
+                actual.dedup();
+            }
             documented.sort();
             if !raises_match(&actual, &documented) {
                 self.push(
@@ -4548,6 +4583,63 @@ mod tests {
             &source,
             "style = 'google'\nskip-checking-short-docstrings = false",
         )
+    }
+
+    fn property_raise_codes(
+        prefix: &str,
+        annotation: &str,
+        child: &str,
+        body: &str,
+        documented: &str,
+    ) -> Vec<String> {
+        let source = format!("{prefix}\nclass Parent:\n    @property\n    def pending_failure(self) -> {annotation}:\n        return self._failure\n\nclass Child(Parent):\n{child}    def fail(self):\n        \"\"\"Propagate a stored exception.\n\n        Raises:\n            {documented}: Original operation failure.\n        \"\"\"\n{body}\n");
+        codes_with_options(
+            &source,
+            "style = 'google'\nskip-checking-short-docstrings = false",
+        )
+    }
+
+    #[test]
+    fn inherited_exception_property_and_nullable_local_narrowing() {
+        for (prefix, annotation, body) in [
+            ("", "OSError | None", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "        failure = self.pending_failure\n        if failure is not None:\n            raise failure"),
+            ("", "OSError | None", "        if self.pending_failure is None:\n            return\n        raise self.pending_failure"),
+            ("", "OSError", "        raise self.pending_failure"),
+            ("from typing import Optional", "Optional[OSError]", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "\"OSError | None\"", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("from builtins import OSError as NativeFailure", "NativeFailure | None", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+        ] {
+            let codes = property_raise_codes(prefix, annotation, "", body, "OSError");
+            assert!(!codes.contains(&"SKD503".to_string()), "{prefix};{annotation};{body}: {codes:?}");
+            let wrong = property_raise_codes(prefix, annotation, "", body, "ValueError");
+            assert!(wrong.contains(&"SKD503".to_string()), "wrong docs unexpectedly accepted: {body}");
+        }
+    }
+
+    #[test]
+    fn inherited_exception_property_unknown_and_shadowed_values_remain_errors() {
+        for (prefix, annotation, child, body) in [
+            ("", "OSError | None", "", "        raise self.pending_failure"),
+            ("", "OSError | None", "", "        if self.pending_failure is None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "    pending_failure = unknown\n", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "    def pending_failure(self):\n        return unknown\n", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("property = unknown", "OSError | None", "", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("OSError = int", "OSError | None", "", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "object", "", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "", "        self = unknown\n        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "", "        self.pending_failure = unknown\n        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "", "        failure = self.pending_failure\n        failure = unknown\n        if failure is not None:\n            raise failure"),
+            ("", "OSError | None", "", "        for self in values:\n            if self.pending_failure is not None:\n                raise self.pending_failure"),
+            ("", "OSError | None", "", "        failure = self.pending_failure\n        if failure is not None:\n            def failure():\n                return None\n            raise failure"),
+            ("", "OSError | None", "", "        if self.pending_failure is not None:\n            alias = self\n            alias.pending_failure = unknown\n            raise self.pending_failure"),
+            ("", "OSError | None", "", "        values[(self := unknown)] = None\n        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "", "        count += (self := unknown)\n        if self.pending_failure is not None:\n            raise self.pending_failure"),
+            ("", "OSError | None", "    property = unknown\n    @property\n    def pending_failure(self) -> OSError | None:\n        return self._failure\n", "        if self.pending_failure is not None:\n            raise self.pending_failure"),
+        ] {
+            let codes = property_raise_codes(prefix, annotation, child, body, "OSError");
+            assert!(codes.contains(&"SKD503".to_string()), "unproven property accepted: {prefix};{annotation};{child};{body}: {codes:?}");
+        }
     }
 
     #[test]
