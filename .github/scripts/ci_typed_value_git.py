@@ -62,7 +62,6 @@ run('actual-native-version', [python, '-m', 'sklint', '--version', '--verbose'])
 run('original-package-smoke', [python, '-I', '-B', source / '.github/scripts/ci_sklint.py', 'smoke'])
 cases = root / 'own-regressions'
 cases.mkdir()
-(cases / 'pyproject.toml').write_text('[tool.sklint]\nselect = ["SKD503"]\n')
 property_case = '''class Parent:
     def __init__(self, failure: OSError | None) -> None:
         self._failure = failure
@@ -93,7 +92,8 @@ for name, text, expected in [('property-true', property_case, 0), ('property-wro
     path.write_text(text)
     result = run(name, [python, '-m', 'sklint', 'check', '--format', 'json', path], cwd=cases, required=False)
     diagnostics = json.loads(result.stdout)['diagnostics']
-    assert len(diagnostics) == expected and all(d['code'] == 'SKD503' for d in diagnostics)
-    controls.append({'name': name, 'source_sha256': sha256(path.read_bytes()).hexdigest(), 'diagnostics': diagnostics})
+    raised_value_errors = [d for d in diagnostics if d['code'] == 'SKD503']
+    assert len(raised_value_errors) == expected
+    controls.append({'name': name, 'source_sha256': sha256(path.read_bytes()).hexdigest(), 'SKD503': raised_value_errors, 'all_diagnostics_retained': diagnostics})
 result = {'status': 'PASS_ORDINARY_NATIVE_LINUX_GIT_INSTALL_ORIGINAL_SMOKE_AND_OWN_PUBLIC_REGRESSIONS', 'head': HEAD, 'review_ref': REF, 'integrity': integrity, 'controls': controls, 'stages': rows, 'Root_source_or_config_uploaded': False, 'R68_gate_replaced': False, 'default_SDK_or_index_changed': False}
 (out / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
