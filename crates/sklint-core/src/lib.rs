@@ -18,6 +18,8 @@ mod exception_values;
 pub mod formatter;
 mod identifier;
 pub mod magic_constants;
+#[cfg(test)]
+mod pep758_tests;
 mod pep810;
 pub mod pydoclint;
 pub mod pydoclint_doc;

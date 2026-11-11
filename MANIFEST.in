@@ -15,3 +15,5 @@ recursive-exclude vscode/node_modules *
 recursive-exclude .pytest_cache *
 recursive-exclude __pycache__ *
 recursive-exclude .venv *
+
+recursive-include vendor/rustpython-parser *

@@ -1,0 +1,22 @@
+{
+  "upstream_registry_package": "rustpython-parser",
+  "upstream_version": "0.4.0",
+  "registry_archive_sha256": "868f724daac0caf9bd36d38caf45819905193a901e8f1c983345a68e18fb2abb",
+  "private_patched_version": "0.4.0+stablekite.1",
+  "scope": "Real LALRPOP except/except* no-as grammar accepts non-star expression lists; as branches remain single-expression and thus require tuple parentheses. Default lalrpop regenerates the actual parser from the changed grammar. SKLint rules and formatter algorithms are unchanged.",
+  "changed_upstream_files": [
+    {
+      "file": "Cargo.toml",
+      "before_sha256": "f8497efa4edd627e75821ed8ddae4dab898ece02206e8787f39138da06774210",
+      "after_sha256": "be895ce7eb16ae4d631d2d2a1ab410974acc08e6c8ce8747bee53bfd15e5c236"
+    },
+    {
+      "file": "src/python.lalrpop",
+      "before_sha256": "ad2b98cd61fe688c2519ce5e294f1061e11156ec9a7f434e3bada7e8f8647eed",
+      "after_sha256": "3c30d772dd94d4131c6bb029010f3bd75868bce57fa255594c179dead104e183"
+    }
+  ],
+  "upstream_repository": "https://github.com/RustPython/Parser",
+  "upstream_source_commit": "8dd2aea26778d8d6917770f8e32bea1b9cdc0ae8",
+  "license_git_blob": "7213274e0f03a5c81844825c9dfdf9d44031927a"
+}

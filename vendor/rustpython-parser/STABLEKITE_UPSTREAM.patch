@@ -1,0 +1,39 @@
+--- upstream/Cargo.toml
++++ patched/Cargo.toml
+@@ -13,7 +13,7 @@
+ edition = "2021"
+ rust-version = "1.72.1"
+ name = "rustpython-parser"
+-version = "0.4.0"
++version = "0.4.0+stablekite.1"
+ authors = ["RustPython Team"]
+ build = "build.rs"
+ autobins = false
+@@ -105,6 +105,7 @@
+ default = [
+     "location",
+     "malachite-bigint",
++    "lalrpop",
+ ]
+ full-lexer = []
+ location = [
+--- upstream/src/python.lalrpop
++++ patched/src/python.lalrpop
+@@ -877,7 +877,7 @@
+ };
+ 
+ ExceptStarClause: ast::ExceptHandler = {
+-    <location:@L> "except" "*" <typ:Test<"all">> ":" <body:Suite> => {
++    <location:@L> "except" "*" <typ:GenericList<Test<"all">>> ":" <body:Suite> => {
+         let end_location = body.last().unwrap().end();
+         ast::ExceptHandler::ExceptHandler(
+             ast::ExceptHandlerExceptHandler {
+@@ -903,7 +903,7 @@
+ 
+ 
+ ExceptClause: ast::ExceptHandler = {
+-    <location:@L> "except" <typ:Test<"all">?> ":" <body:Suite> => {
++    <location:@L> "except" <typ:GenericList<Test<"all">>?> ":" <body:Suite> => {
+         let end_location = body.last().unwrap().end();
+         ast::ExceptHandler::ExceptHandler(
+             ast::ExceptHandlerExceptHandler {
