@@ -62,6 +62,7 @@ run('actual-native-version', [python, '-m', 'sklint', '--version', '--verbose'])
 run('original-package-smoke', [python, '-I', '-B', source / '.github/scripts/ci_sklint.py', 'smoke'])
 cases = root / 'own-regressions'
 cases.mkdir()
+(cases / 'pyproject.toml').write_text('[tool.sklint]\nstrict = true\n')
 property_case = '''class Parent:
     def __init__(self, failure: OSError | None) -> None:
         self._failure = failure
