@@ -2,6 +2,8 @@ use crate::config::EffectiveConfig;
 use crate::dataclass_model::DataclassModel;
 use crate::diagnostic::{Diagnostic, Span};
 use crate::python_ast::PythonAst;
+use rustpython_ast::Visitor;
+use rustpython_parser::ast::{self, Expr};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -30,6 +32,228 @@ struct ConstructedVariable {
     end_line: usize,
 }
 
+#[derive(Clone, Copy)]
+struct SelfOwner {
+    class_line: usize,
+}
+
+type AssignmentOwners = HashMap<(usize, usize), SelfOwner>;
+
+/// Function-local bindings apply to the whole function, including earlier uses.
+/// A nested scope's bindings do not shadow a captured receiver in its parent.
+#[derive(Default)]
+struct SelfBindings {
+    local: bool,
+    global: bool,
+    nonlocal: bool,
+}
+
+impl Visitor for SelfBindings {
+    fn visit_expr_name(&mut self, node: ast::ExprName) {
+        if node.id.as_str() == "self"
+            && matches!(node.ctx, ast::ExprContext::Store | ast::ExprContext::Del)
+        {
+            self.local = true;
+        }
+    }
+
+    fn visit_stmt_function_def(&mut self, node: ast::StmtFunctionDef) {
+        self.local |= node.name.as_str() == "self";
+    }
+
+    fn visit_stmt_async_function_def(&mut self, node: ast::StmtAsyncFunctionDef) {
+        self.local |= node.name.as_str() == "self";
+    }
+
+    fn visit_stmt_class_def(&mut self, node: ast::StmtClassDef) {
+        self.local |= node.name.as_str() == "self";
+    }
+
+    fn visit_expr_lambda(&mut self, _node: ast::ExprLambda) {}
+
+    fn visit_stmt_import(&mut self, node: ast::StmtImport) {
+        self.local |= node.names.iter().any(|alias| {
+            alias
+                .asname
+                .as_ref()
+                .map(|name| name.as_str())
+                .unwrap_or_else(|| alias.name.as_str().split('.').next().unwrap_or(""))
+                == "self"
+        });
+    }
+
+    fn visit_stmt_import_from(&mut self, node: ast::StmtImportFrom) {
+        self.local |= node
+            .names
+            .iter()
+            .any(|alias| alias.asname.as_ref().unwrap_or(&alias.name).as_str() == "self");
+    }
+
+    fn visit_excepthandler_except_handler(&mut self, node: ast::ExceptHandlerExceptHandler) {
+        self.local |= node
+            .name
+            .as_ref()
+            .is_some_and(|name| name.as_str() == "self");
+        self.generic_visit_excepthandler_except_handler(node);
+    }
+
+    fn visit_pattern_match_as(&mut self, node: ast::PatternMatchAs) {
+        self.local |= node
+            .name
+            .as_ref()
+            .is_some_and(|name| name.as_str() == "self");
+        self.generic_visit_pattern_match_as(node);
+    }
+
+    fn visit_pattern_match_star(&mut self, node: ast::PatternMatchStar) {
+        self.local |= node
+            .name
+            .as_ref()
+            .is_some_and(|name| name.as_str() == "self");
+    }
+
+    fn visit_pattern_match_mapping(&mut self, node: ast::PatternMatchMapping) {
+        self.local |= node
+            .rest
+            .as_ref()
+            .is_some_and(|name| name.as_str() == "self");
+        self.generic_visit_pattern_match_mapping(node);
+    }
+
+    fn visit_comprehension(&mut self, node: ast::Comprehension) {
+        // The iteration target is local to the comprehension, not the function.
+        self.visit_expr(node.iter);
+        for condition in node.ifs {
+            self.visit_expr(condition);
+        }
+    }
+
+    fn visit_stmt_global(&mut self, node: ast::StmtGlobal) {
+        self.global |= node.names.iter().any(|name| name.as_str() == "self");
+    }
+
+    fn visit_stmt_nonlocal(&mut self, node: ast::StmtNonlocal) {
+        self.nonlocal |= node.names.iter().any(|name| name.as_str() == "self");
+    }
+}
+
+fn has_self_parameter(args: &ast::Arguments) -> bool {
+    args.posonlyargs
+        .iter()
+        .chain(&args.args)
+        .chain(&args.kwonlyargs)
+        .any(|arg| arg.def.arg.as_str() == "self")
+        || args
+            .vararg
+            .as_ref()
+            .is_some_and(|arg| arg.arg.as_str() == "self")
+        || args
+            .kwarg
+            .as_ref()
+            .is_some_and(|arg| arg.arg.as_str() == "self")
+}
+
+struct OwnershipVisitor<'a> {
+    ast: &'a PythonAst,
+    lines: &'a [&'a str],
+    class_body: Option<usize>,
+    receiver: Option<SelfOwner>,
+    assignments: AssignmentOwners,
+}
+
+impl OwnershipVisitor<'_> {
+    fn function(&mut self, args: &ast::Arguments, body: Vec<ast::Stmt>) {
+        let previous_class = self.class_body.take();
+        let previous_receiver = self.receiver;
+        let mut bindings = SelfBindings::default();
+        for stmt in &body {
+            bindings.visit_stmt(stmt.clone());
+        }
+        self.receiver = if has_self_parameter(args) {
+            previous_class.map(|class_line| SelfOwner { class_line })
+        } else if bindings.global || (bindings.local && !bindings.nonlocal) {
+            None
+        } else {
+            previous_receiver
+        };
+        for stmt in body {
+            self.visit_stmt(stmt);
+        }
+        self.receiver = previous_receiver;
+        self.class_body = previous_class;
+    }
+}
+
+impl Visitor for OwnershipVisitor<'_> {
+    fn visit_stmt_class_def(&mut self, node: ast::StmtClassDef) {
+        let previous = self.class_body.replace(self.ast.location_of(&node).line);
+        for stmt in node.body {
+            self.visit_stmt(stmt);
+        }
+        self.class_body = previous;
+    }
+
+    fn visit_stmt_function_def(&mut self, node: ast::StmtFunctionDef) {
+        self.function(&node.args, node.body);
+    }
+
+    fn visit_stmt_async_function_def(&mut self, node: ast::StmtAsyncFunctionDef) {
+        self.function(&node.args, node.body);
+    }
+
+    fn visit_expr_lambda(&mut self, node: ast::ExprLambda) {
+        let previous = self.receiver;
+        if has_self_parameter(&node.args) {
+            self.receiver = None;
+        }
+        self.visit_expr(*node.body);
+        self.receiver = previous;
+    }
+
+    fn visit_expr_attribute(&mut self, node: ast::ExprAttribute) {
+        if matches!(node.ctx, ast::ExprContext::Store)
+            && matches!(node.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+        {
+            if let Some(owner) = self.receiver {
+                let end = self.ast.end_location_of(&node);
+                if let Some(line) = self.lines.get(end.line - 1) {
+                    let attr_start = end.column - 1 - node.attr.as_str().len();
+                    let column = line[..attr_start].chars().count() + 1;
+                    self.assignments.insert((end.line, column), owner);
+                }
+            }
+        }
+        self.generic_visit_expr_attribute(node);
+    }
+}
+
+fn assignment_owners(ast: &PythonAst, lines: &[&str]) -> AssignmentOwners {
+    let mut visitor = OwnershipVisitor {
+        ast,
+        lines,
+        class_body: None,
+        receiver: None,
+        assignments: HashMap::new(),
+    };
+    for stmt in &ast.suite {
+        visitor.visit_stmt(stmt.clone());
+    }
+    visitor.assignments
+}
+
+fn assignment_belongs_to(
+    owners: Option<&AssignmentOwners>,
+    class_line: usize,
+    line: usize,
+    column: usize,
+) -> bool {
+    owners.is_none_or(|owners| {
+        owners
+            .get(&(line, column))
+            .is_some_and(|owner| owner.class_line == class_line)
+    })
+}
+
 pub fn run_dynamic_attribute_rules(
     path: &Path,
     source: &str,
@@ -43,20 +267,17 @@ pub fn run_dynamic_attribute_rules(
 
     let display_path = path.display().to_string();
     let lines: Vec<&str> = source.lines().collect();
-    let classes = collect_classes(&lines);
-    let project_declared = PythonAst::parse(source, &display_path)
-        .ok()
-        .map(|ast| DataclassModel::from_path(path, source, &ast))
+    let ast = PythonAst::parse(source, &display_path).ok();
+    let owners = ast.as_ref().map(|ast| assignment_owners(ast, &lines));
+    let classes = collect_classes(&lines, owners.as_ref());
+    let project_declared = ast
+        .as_ref()
+        .map(|ast| DataclassModel::from_path(path, source, ast))
         .map(|model| {
             model
                 .classes
                 .iter()
-                .map(|class| {
-                    (
-                        class.name.clone(),
-                        model.effective_declared_attrs(&class.name),
-                    )
-                })
+                .map(|class| (class.line, model.effective_declared_attrs(&class.name)))
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
@@ -67,6 +288,7 @@ pub fn run_dynamic_attribute_rules(
             &display_path,
             &lines,
             &classes,
+            owners.as_ref(),
             &project_declared,
             &mut diagnostics,
         );
@@ -88,7 +310,8 @@ fn run_self_dynamic_attribute_rule(
     display_path: &str,
     lines: &[&str],
     classes: &[ClassInfo],
-    project_declared: &HashMap<String, HashSet<String>>,
+    owners: Option<&AssignmentOwners>,
+    project_declared: &HashMap<usize, HashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (class_idx, class) in classes.iter().enumerate() {
@@ -103,6 +326,9 @@ fn run_self_dynamic_attribute_rule(
                 };
                 let code_part = strip_inline_comment(line);
                 for (attr, start_col, end_col) in self_attribute_assignment_occurrences(code_part) {
+                    if !assignment_belongs_to(owners, class.start_line, line_no, start_col) {
+                        continue;
+                    }
                     if class_declares_attr(classes, class_idx, &attr, project_declared) {
                         continue;
                     }
@@ -129,7 +355,7 @@ fn run_known_dynamic_object_attribute_rule(
     display_path: &str,
     lines: &[&str],
     classes: &[ClassInfo],
-    project_declared: &HashMap<String, HashSet<String>>,
+    project_declared: &HashMap<usize, HashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let variables = collect_constructed_variables(lines, classes);
@@ -296,11 +522,11 @@ fn class_declares_attr(
     classes: &[ClassInfo],
     class_idx: usize,
     attr: &str,
-    project_declared: &HashMap<String, HashSet<String>>,
+    project_declared: &HashMap<usize, HashSet<String>>,
 ) -> bool {
     let class = &classes[class_idx];
     project_declared
-        .get(&class.name)
+        .get(&class.start_line)
         .is_some_and(|attrs| attrs.contains(attr))
         || class.declared_attrs.contains(attr)
         || class.bases.iter().any(|base| {
@@ -324,7 +550,7 @@ fn simple_name(text: &str) -> &str {
     text.rsplit('.').next().unwrap_or(text)
 }
 
-fn collect_classes(lines: &[&str]) -> Vec<ClassInfo> {
+fn collect_classes(lines: &[&str], owners: Option<&AssignmentOwners>) -> Vec<ClassInfo> {
     let mut classes = Vec::new();
     for idx in 0..lines.len() {
         let line = lines[idx];
@@ -337,8 +563,14 @@ fn collect_classes(lines: &[&str]) -> Vec<ClassInfo> {
         let class_start = idx + 1;
         let class_end = block_end(lines, class_start, class_indent);
         let methods = collect_methods(lines, class_start + 1, class_end, class_indent);
-        let declared_attrs =
-            collect_declared_attrs(lines, class_start + 1, class_end, class_indent, &methods);
+        let declared_attrs = collect_declared_attrs(
+            lines,
+            class_start + 1,
+            class_end,
+            class_indent,
+            &methods,
+            owners,
+        );
 
         classes.push(ClassInfo {
             name,
@@ -393,6 +625,7 @@ fn collect_declared_attrs(
     end_line: usize,
     class_indent: usize,
     methods: &[MethodInfo],
+    owners: Option<&AssignmentOwners>,
 ) -> HashSet<String> {
     let mut attrs = HashSet::new();
     attrs.insert("__class__".to_string());
@@ -427,20 +660,15 @@ fn collect_declared_attrs(
                 continue;
             };
             let code_part = strip_inline_comment(line);
-            for attr in self_attribute_assignments(code_part) {
-                attrs.insert(attr);
+            for (attr, column, _) in self_attribute_assignment_occurrences(code_part) {
+                if assignment_belongs_to(owners, start_line - 1, line_no, column) {
+                    attrs.insert(attr);
+                }
             }
         }
     }
 
     attrs
-}
-
-fn self_attribute_assignments(line: &str) -> Vec<String> {
-    self_attribute_assignment_occurrences(line)
-        .into_iter()
-        .map(|(attr, _start_col, _end_col)| attr)
-        .collect()
 }
 
 fn self_attribute_assignment_occurrences(line: &str) -> Vec<(String, usize, usize)> {
@@ -742,6 +970,115 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn nested_initializer_belongs_to_inner_not_outer() {
+        let source = "class Outer:\n    def make(self):\n        class Inner:\n            _event_owner: int\n            def __init__(self, owner):\n                self._event_owner = owner\n        return Inner(1)\n\nclass Invalid:\n    def set_value(self, owner):\n        self._undeclared = owner\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 11);
+        assert!(diagnostics[0].message.contains("in `Invalid`"));
+    }
+
+    #[test]
+    fn nested_initializer_does_not_declare_an_outer_field() {
+        let source = "class Outer:\n    def __init__(self):\n        class Inner:\n            def __init__(self):\n                self.shared = 1\n    def update(self):\n        self.shared = 2\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 7);
+        assert!(diagnostics[0].message.contains("in `Outer`"));
+    }
+
+    #[test]
+    fn nested_methods_report_only_their_actual_class() {
+        let source = "class Outer:\n    def make(self):\n        class Inner:\n            def update(self):\n                self.dynamic = 1\n        return Inner()\n    def update(self):\n        self.other = 2\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.line == 5 && d.message.contains("in `Inner`")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.line == 8 && d.message.contains("in `Outer`")));
+    }
+
+    #[test]
+    fn sibling_nested_classes_keep_separate_declarations() {
+        let source = "class Outer:\n    def make(self):\n        class First:\n            value: int\n            def update(self):\n                self.value = 1\n        class Second:\n            def update(self):\n                self.value = 2\n        return First(), Second()\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 9);
+        assert!(diagnostics[0].message.contains("in `Second`"));
+    }
+
+    #[test]
+    fn deep_nested_classes_preserve_positive_and_negative_owners() {
+        let source = "class Outer:\n    def make(self):\n        class Middle:\n            def make(self):\n                class Inner:\n                    def __init__(self):\n                        self.valid = 1\n                    def update(self):\n                        self.invalid = 2\n                return Inner()\n        return Middle()\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 9);
+        assert!(diagnostics[0].message.contains("in `Inner`"));
+    }
+
+    #[test]
+    fn closure_capturing_self_still_reports_the_enclosing_class() {
+        let source = "class Outer:\n    def make(self):\n        def update():\n            self.dynamic = 1\n        return update\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 4);
+        assert!(diagnostics[0].message.contains("in `Outer`"));
+    }
+
+    #[test]
+    fn closure_parameter_self_does_not_belong_to_outer() {
+        let source = "class Outer:\n    def make(self):\n        def update(self):\n            self.foreign = 1\n        self.actual = 2\n        return update\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 5);
+        assert!(diagnostics[0].message.contains("`actual`"));
+    }
+
+    #[test]
+    fn closure_local_self_shadows_even_before_its_assignment() {
+        let source = "class Outer:\n    def make(self):\n        def update(value):\n            self.foreign = 1\n            self = value\n        self.actual = 2\n        return update\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 6);
+    }
+
+    #[test]
+    fn closure_nonlocal_self_retains_the_enclosing_owner() {
+        let source = "class Outer:\n    def make(self):\n        def update():\n            nonlocal self\n            self.dynamic = 1\n        return update\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 5);
+    }
+
+    #[test]
+    fn closure_global_self_does_not_belong_to_outer() {
+        let source = "class Outer:\n    def make(self):\n        def update():\n            global self\n            self.foreign = 1\n        self.actual = 2\n        return update\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 6);
+    }
+
+    #[test]
+    fn nested_same_name_does_not_inherit_an_unrelated_top_level_declaration() {
+        let source = "class Inner:\n    shared: int\n\nclass Outer:\n    def make(self):\n        class Inner:\n            def update(self):\n                self.shared = 1\n        return Inner()\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 8);
+        assert!(diagnostics[0].message.contains("in `Inner`"));
+    }
+
+    #[test]
+    fn unicode_receiver_assignment_columns_retain_character_coordinates() {
+        let source = "class Outer:\n    def update(self):\n        café = 1; self.поле = café\n";
+        let diagnostics = run_dynamic_attribute_rules(Path::new("example.py"), source, &config());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 3);
+        assert_eq!(diagnostics[0].column, 24);
     }
 
     #[test]
