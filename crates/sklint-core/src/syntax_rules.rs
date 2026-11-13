@@ -1,6 +1,9 @@
 use crate::config::{name_matches_pattern, EffectiveConfig};
 use crate::diagnostic::{Diagnostic, Fix, Span};
 use crate::identifier::{is_identifier_continue, is_identifier_start};
+use crate::python_ast::{expression_text, PythonAst};
+use rustpython_ast::Visitor;
+use rustpython_parser::ast::{self, Expr, Stmt};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
@@ -73,11 +76,18 @@ pub fn run_syntax_rules(path: &Path, source: &str, config: &EffectiveConfig) -> 
     if config.is_enabled("SK508") {
         run_future_annotations_import(&display_path, source, &lines, &mut diagnostics);
     }
+    let evaluation_ast = (config.is_enabled("SK801") || config.is_enabled("SK802"))
+        .then(|| PythonAst::parse(source, &display_path).ok())
+        .flatten();
     if config.is_enabled("SK801") {
-        run_inline_temp_variable(&display_path, &lines, &defs, &mut diagnostics);
+        if let Some(ast) = &evaluation_ast {
+            run_inline_temp_variable(&display_path, &lines, &defs, ast, &mut diagnostics);
+        }
     }
     if config.is_enabled("SK802") {
-        run_return_ternary(&display_path, &lines, &mut diagnostics);
+        if let Some(ast) = &evaluation_ast {
+            run_return_ternary(&display_path, source, &lines, ast, &mut diagnostics);
+        }
     }
     if config.is_enabled("SK803") {
         run_loop_comprehension(&display_path, &lines, &mut diagnostics);
@@ -1682,8 +1692,10 @@ fn run_inline_temp_variable(
     display_path: &str,
     lines: &[LineInfo],
     defs: &[DefInfo],
+    ast: &PythonAst,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let regions = InlineEvaluationRegions::collect(ast);
     for idx in 0..lines.len().saturating_sub(1) {
         let line = &lines[idx];
         let next_idx = idx + 1;
@@ -1747,6 +1759,9 @@ fn run_inline_temp_variable(
         {
             continue;
         }
+        if !regions.same_execution(line.no, next.no, statement_end_idx + 1, name) {
+            continue;
+        }
         let scope_end_idx = lexical_scope_end_idx(lines, defs, line.no);
         if statement_end_idx < scope_end_idx
             && lines[statement_end_idx + 1..=scope_end_idx]
@@ -1784,6 +1799,226 @@ fn run_inline_temp_variable(
         }
         diagnostics.push(diagnostic);
     }
+}
+
+/// A lexical occurrence need not execute once. Keep the assignment and its
+/// load in the same invocation/iteration, including eager comprehension
+/// iterables and function defaults, rather than excluding entire constructs.
+struct InlineEvaluationRegions<'a> {
+    ast: &'a PythonAst,
+    current: usize,
+    next: usize,
+    stores: HashMap<(usize, String), usize>,
+    loads: HashMap<(usize, String), Vec<usize>>,
+}
+
+impl<'a> InlineEvaluationRegions<'a> {
+    fn collect(ast: &'a PythonAst) -> Self {
+        let mut result = Self {
+            ast,
+            current: 0,
+            next: 0,
+            stores: HashMap::new(),
+            loads: HashMap::new(),
+        };
+        for stmt in &ast.suite {
+            result.visit_stmt(stmt.clone());
+        }
+        result
+    }
+
+    fn separate(&mut self, visit: impl FnOnce(&mut Self)) {
+        let previous = self.current;
+        self.next += 1;
+        self.current = self.next;
+        visit(self);
+        self.current = previous;
+    }
+
+    fn same_execution(&self, assignment: usize, start: usize, end: usize, name: &str) -> bool {
+        let Some(region) = self.stores.get(&(assignment, name.to_string())) else {
+            return false;
+        };
+        let uses: Vec<_> = (start..=end)
+            .filter_map(|line| self.loads.get(&(line, name.to_string())))
+            .flatten()
+            .collect();
+        uses.len() == 1 && uses[0] == region
+    }
+
+    fn defaults(&mut self, args: ast::Arguments) {
+        for arg in args
+            .posonlyargs
+            .into_iter()
+            .chain(args.args)
+            .chain(args.kwonlyargs)
+        {
+            if let Some(value) = arg.default {
+                self.visit_expr(*value);
+            }
+            if let Some(annotation) = arg.def.annotation {
+                self.separate(|visitor| visitor.visit_expr(*annotation));
+            }
+        }
+    }
+
+    fn comprehension(&mut self, generators: Vec<ast::Comprehension>, values: Vec<Expr>) {
+        let mut generators = generators.into_iter();
+        let Some(first) = generators.next() else {
+            return;
+        };
+        // Python evaluates the outer iterable in the enclosing execution,
+        // including when constructing a generator expression.
+        self.visit_expr(first.iter);
+        self.separate(|visitor| {
+            visitor.visit_expr(first.target);
+            for condition in first.ifs {
+                visitor.visit_expr(condition);
+            }
+            for generator in generators {
+                visitor.visit_expr(generator.iter);
+                visitor.visit_expr(generator.target);
+                for condition in generator.ifs {
+                    visitor.visit_expr(condition);
+                }
+            }
+            for value in values {
+                visitor.visit_expr(value);
+            }
+        });
+    }
+}
+
+impl Visitor for InlineEvaluationRegions<'_> {
+    fn visit_expr_name(&mut self, node: ast::ExprName) {
+        let key = (self.ast.location_of(&node).line, node.id.to_string());
+        match node.ctx {
+            ast::ExprContext::Store => {
+                self.stores.insert(key, self.current);
+            }
+            ast::ExprContext::Load => {
+                self.loads.entry(key).or_default().push(self.current);
+            }
+            ast::ExprContext::Del => {}
+        }
+    }
+
+    fn visit_stmt_while(&mut self, node: ast::StmtWhile) {
+        self.separate(|visitor| {
+            visitor.visit_expr(*node.test);
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+        for stmt in node.orelse {
+            self.visit_stmt(stmt);
+        }
+    }
+
+    fn visit_stmt_for(&mut self, node: ast::StmtFor) {
+        self.visit_expr(*node.iter);
+        self.separate(|visitor| {
+            visitor.visit_expr(*node.target);
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+        for stmt in node.orelse {
+            self.visit_stmt(stmt);
+        }
+    }
+
+    fn visit_stmt_async_for(&mut self, node: ast::StmtAsyncFor) {
+        self.visit_expr(*node.iter);
+        self.separate(|visitor| {
+            visitor.visit_expr(*node.target);
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+        for stmt in node.orelse {
+            self.visit_stmt(stmt);
+        }
+    }
+
+    fn visit_stmt_function_def(&mut self, node: ast::StmtFunctionDef) {
+        self.defaults(*node.args);
+        for decorator in node.decorator_list {
+            self.visit_expr(decorator);
+        }
+        if let Some(annotation) = node.returns {
+            self.separate(|visitor| visitor.visit_expr(*annotation));
+        }
+        self.separate(|visitor| {
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+    }
+
+    fn visit_stmt_async_function_def(&mut self, node: ast::StmtAsyncFunctionDef) {
+        self.defaults(*node.args);
+        for decorator in node.decorator_list {
+            self.visit_expr(decorator);
+        }
+        if let Some(annotation) = node.returns {
+            self.separate(|visitor| visitor.visit_expr(*annotation));
+        }
+        self.separate(|visitor| {
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+    }
+
+    fn visit_expr_lambda(&mut self, node: ast::ExprLambda) {
+        self.defaults(*node.args);
+        self.separate(|visitor| visitor.visit_expr(*node.body));
+    }
+
+    fn visit_expr_call(&mut self, node: ast::ExprCall) {
+        if let Expr::Lambda(lambda) = node.func.as_ref() {
+            let mut suspension = LambdaSuspension(false);
+            suspension.visit_expr(*lambda.body.clone());
+            if !suspension.0 {
+                self.defaults(*lambda.args.clone());
+                for arg in node.args {
+                    self.visit_expr(arg);
+                }
+                for keyword in node.keywords {
+                    self.visit_expr(keyword.value);
+                }
+                self.visit_expr(*lambda.body.clone());
+                return;
+            }
+        }
+        self.generic_visit_expr_call(node);
+    }
+
+    fn visit_expr_list_comp(&mut self, node: ast::ExprListComp) {
+        self.comprehension(node.generators, vec![*node.elt]);
+    }
+    fn visit_expr_set_comp(&mut self, node: ast::ExprSetComp) {
+        self.comprehension(node.generators, vec![*node.elt]);
+    }
+    fn visit_expr_dict_comp(&mut self, node: ast::ExprDictComp) {
+        self.comprehension(node.generators, vec![*node.key, *node.value]);
+    }
+    fn visit_expr_generator_exp(&mut self, node: ast::ExprGeneratorExp) {
+        self.comprehension(node.generators, vec![*node.elt]);
+    }
+}
+
+struct LambdaSuspension(bool);
+
+impl Visitor for LambdaSuspension {
+    fn visit_expr_yield(&mut self, _node: ast::ExprYield) {
+        self.0 = true;
+    }
+    fn visit_expr_yield_from(&mut self, _node: ast::ExprYieldFrom) {
+        self.0 = true;
+    }
+    fn visit_expr_lambda(&mut self, _node: ast::ExprLambda) {}
 }
 
 fn lexical_scope_end_idx(lines: &[LineInfo], defs: &[DefInfo], line_no: usize) -> usize {
@@ -2137,59 +2372,196 @@ fn strip_inline_comment_raw(text: &str) -> &str {
     text.trim_end()
 }
 
-fn run_return_ternary(display_path: &str, lines: &[LineInfo], diagnostics: &mut Vec<Diagnostic>) {
-    for idx in 0..lines.len().saturating_sub(2) {
-        let if_line = &lines[idx];
-        let return_line = &lines[idx + 1];
-        let fallback = &lines[idx + 2];
-        let trimmed_if = if_line.code.trim_start();
-        if !trimmed_if.starts_with("if ") || !trimmed_if.ends_with(':') {
-            continue;
-        }
-        if return_line.indent <= if_line.indent || fallback.indent != if_line.indent {
-            continue;
-        }
-        let first = return_line.code.trim_start();
-        let second = fallback.code.trim_start();
-        if !first.starts_with("return ") || !second.starts_with("return ") {
-            continue;
-        }
-        let raw_if = strip_inline_comment_raw(if_line.text.trim_start());
-        let cond = raw_if
-            .trim_start_matches("if ")
-            .trim_end_matches(':')
-            .trim();
-        let first_text = return_line.text.trim_start();
-        let second_text = fallback.text.trim_start();
-        let a = first_text.trim_start_matches("return ").trim();
-        let b = second_text.trim_start_matches("return ").trim();
-        let replacement = format!(
-            "{}return {a} if {cond} else {b}",
-            " ".repeat(if_line.indent)
-        );
-        diagnostics.push(
-            Diagnostic::new(
+fn run_return_ternary(
+    display_path: &str,
+    source: &str,
+    lines: &[LineInfo],
+    ast: &PythonAst,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut visitor = ReturnTernaries {
+        display_path,
+        source,
+        lines,
+        ast,
+        diagnostics,
+    };
+    visitor.suite(&ast.suite);
+    for stmt in &ast.suite {
+        visitor.visit_stmt(stmt.clone());
+    }
+}
+
+struct ReturnTernaries<'a> {
+    display_path: &'a str,
+    source: &'a str,
+    lines: &'a [LineInfo],
+    ast: &'a PythonAst,
+    diagnostics: &'a mut Vec<Diagnostic>,
+}
+
+impl ReturnTernaries<'_> {
+    fn suite(&mut self, suite: &[Stmt]) {
+        let mut covered = 0;
+        for index in 0..suite.len() {
+            if index < covered {
+                continue;
+            }
+            let mut branches = Vec::new();
+            let mut tail = index;
+            while let Some(Stmt::If(branch)) = suite.get(tail) {
+                if !branch.orelse.is_empty() || branch.body.len() != 1 {
+                    break;
+                }
+                let Stmt::Return(first) = &branch.body[0] else {
+                    break;
+                };
+                let Some(value) = &first.value else {
+                    break;
+                };
+                branches.push((branch, value));
+                tail += 1;
+            }
+            let Some((branch, _)) = branches.first() else {
+                continue;
+            };
+            let Some(Stmt::Return(fallback)) = suite.get(tail) else {
+                continue;
+            };
+            let Some(b) = &fallback.value else {
+                continue;
+            };
+            covered = tail + 1;
+            let start = self.ast.location_of(*branch);
+            let end = self.ast.end_location_of(fallback);
+            let if_line = &self.lines[start.line - 1];
+            let last = &self.lines[end.line - 1];
+            let mut diagnostic = Diagnostic::new(
                 "SK802",
                 "Return branches should be collapsed into a ternary expression in strict mode",
-                display_path,
+                self.display_path,
                 Span::new(
                     if_line.no,
                     if_line.indent + 1,
-                    fallback.no,
-                    fallback.text.chars().count() + 1,
+                    last.no,
+                    last.text.chars().count() + 1,
                 ),
                 "warning",
-            )
-            .with_fix(Fix {
-                safe: true,
-                message: "Collapse returns into a ternary".to_string(),
-                replacement,
-                start_line: if_line.no,
-                start_column: 1,
-                end_line: fallback.no,
-                end_column: fallback.text.chars().count() + 1,
-            }),
-        );
+            );
+            // Retain the diagnostic but do not discard or relocate comments
+            // (including line-specific type/lint directives) in an auto-fix.
+            let comments = self.lines[start.line - 1..end.line].iter().any(|line| {
+                strip_inline_comment_raw(&line.text).len() < line.text.trim_end().len()
+            });
+            if !comments {
+                // Fold a complete terminal chain in one fix, keeping the
+                // original guard order and short-circuit branch evaluation.
+                let mut expression = ternary_operand(self.source, b);
+                let mut expected = *b.clone();
+                for (branch, a) in branches.iter().rev() {
+                    expression = format!(
+                        "{} if {} else {expression}",
+                        ternary_operand(self.source, a),
+                        ternary_operand(self.source, &branch.test)
+                    );
+                    expected = Expr::IfExp(ast::ExprIfExp {
+                        range: branch.range,
+                        test: branch.test.clone(),
+                        body: (*a).clone(),
+                        orelse: Box::new(expected),
+                    });
+                }
+                // A fix is safe only when it parses as the entire intended
+                // conditional expression, never a tuple containing one.
+                let parsed = PythonAst::parse(&format!("return {expression}"), self.display_path);
+                let correct = parsed.is_ok_and(|parsed| {
+                    matches!(parsed.suite.as_slice(), [Stmt::Return(ret)]
+                        if ret.value.as_ref().is_some_and(|value| value.to_string() == expected.to_string()))
+                });
+                if correct {
+                    diagnostic = diagnostic.with_fix(Fix {
+                        safe: true,
+                        message: "Collapse returns into a ternary".to_string(),
+                        replacement: format!("{}return {expression}", " ".repeat(if_line.indent)),
+                        start_line: if_line.no,
+                        start_column: 1,
+                        end_line: end.line,
+                        end_column: byte_to_column(&last.text, end.column - 1),
+                    });
+                }
+            }
+            self.diagnostics.push(diagnostic);
+        }
+    }
+}
+
+fn ternary_operand(source: &str, expression: &Expr) -> String {
+    let text = expression_text(source, expression);
+    if text.contains('\n')
+        || matches!(
+            expression,
+            Expr::Tuple(_)
+                | Expr::Lambda(_)
+                | Expr::IfExp(_)
+                | Expr::NamedExpr(_)
+                | Expr::Yield(_)
+                | Expr::YieldFrom(_)
+        )
+    {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+impl Visitor for ReturnTernaries<'_> {
+    fn visit_stmt(&mut self, node: Stmt) {
+        match &node {
+            Stmt::FunctionDef(n) => self.suite(&n.body),
+            Stmt::AsyncFunctionDef(n) => self.suite(&n.body),
+            Stmt::ClassDef(n) => self.suite(&n.body),
+            Stmt::If(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+            }
+            Stmt::While(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+            }
+            Stmt::For(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+            }
+            Stmt::AsyncFor(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+            }
+            Stmt::With(n) => self.suite(&n.body),
+            Stmt::AsyncWith(n) => self.suite(&n.body),
+            Stmt::Try(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+                self.suite(&n.finalbody);
+                for ast::ExceptHandler::ExceptHandler(h) in &n.handlers {
+                    self.suite(&h.body);
+                }
+            }
+            Stmt::TryStar(n) => {
+                self.suite(&n.body);
+                self.suite(&n.orelse);
+                self.suite(&n.finalbody);
+                for ast::ExceptHandler::ExceptHandler(h) in &n.handlers {
+                    self.suite(&h.body);
+                }
+            }
+            Stmt::Match(n) => {
+                for case in &n.cases {
+                    self.suite(&case.body);
+                }
+            }
+            _ => {}
+        }
+        self.generic_visit_stmt(node);
     }
 }
 
@@ -3312,3 +3684,7 @@ print(sys.executable)
         assert!(replacement.starts_with("__all__ = (\"Public\",)\n\nclass Public:"));
     }
 }
+
+#[cfg(test)]
+#[path = "syntax_evaluation_tests.rs"]
+mod evaluation_tests;
