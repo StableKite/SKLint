@@ -127,7 +127,7 @@ fn sk802_none_and_tuple_results_do_not_become_nested_tuples() {
 #[test]
 fn sk802_multiline_and_nested_conditional_expressions_have_safe_fixes() {
     for source in [
-        "def choose(flag):\n    if flag:\n        return (\n            first(),\n            second(),\n        )\n    return (\n        third(),\n        fourth(),\n    )\n",
+        "def choose(flag):\n    if flag:\n        return first(), second()\n    return (\n        third(),\n        fourth(),\n    )\n",
         "def choose(flag):\n    if (flag if outer else other):\n        return first if inner else second\n    return third if alternate else fourth\n",
         "def choose(flag):\n    if flag:\n        return lambda: first()\n    return lambda: second()\n",
         "def choose(flag):\n    if flag:\n        return 'literal#not-comment'\n    return 'other'\n",
@@ -142,8 +142,7 @@ fn sk802_multiline_and_nested_conditional_expressions_have_safe_fixes() {
 fn sk802_preserves_comments_and_diagnostics_without_a_lossy_fix() {
     for source in [
         "def choose(flag):\n    if flag:\n        return first()  # type: ignore[return-value]\n    return second()\n",
-        "def choose(flag):\n    if flag:  # explain condition\n        return first()\n    return second()\n",
-        "def choose(flag):\n    if flag:\n        return first()\n    # explain fallback\n    return second()\n",
+        "def choose(flag):\n    if flag:\n        return first()\n    return second()  # explain fallback\n",
     ] {
         let reports = diagnostics(source, "SK802");
         assert_eq!(reports.len(), 1, "{source}");
@@ -158,7 +157,57 @@ fn sk802_collapses_a_complete_terminal_chain_in_one_fix() {
     assert_eq!(reports.len(), 1);
     let fix = reports[0].fix.as_ref().unwrap();
     assert!(fix.safe);
+    assert_eq!(reports[0].line, 6);
     assert_eq!(fix.start_line, 2);
     assert_eq!(fix.end_line, 8);
     assert_eq!(fix.replacement, "    return (1, 2) if flag == 1 else (3, 4) if flag == 2 else (5, 6) if flag == 3 else (7, 8)");
+}
+
+#[test]
+fn sk802_does_not_expand_the_original_diagnostic_eligibility() {
+    for source in [
+        "def choose(flag):\n    if flag:\n        return first()\n\n    return second()\n",
+        "def choose(flag):\n    if flag:\n        return (\n            first(),\n            second(),\n        )\n    return third()\n",
+        "def choose(flag):\n    if (\n        flag\n    ):\n        return first()\n    return second()\n",
+        "def choose(flag):\n    if flag:\n        return first()\n    # explain fallback\n    return second()\n",
+    ] {
+        assert!(diagnostics(source, "SK802").is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn sk801_keeps_safe_immutable_constants_in_repeated_regions() {
+    for value in [
+        "1", "None", "'value'", "b'value'", "(1, 2)", "-1", "~1", "not None",
+    ] {
+        for expression in [
+            "[value for _ in range(3)]",
+            "lambda: value",
+            "(value for _ in range(3))",
+        ] {
+            let source = format!("def make():\n    value = {value}\n    return {expression}\n");
+            assert_eq!(diagnostics(&source, "SK801").len(), 1, "{source}");
+        }
+    }
+    for value in ["[]", "{}", "set()", "([],)"] {
+        let source =
+            format!("def make():\n    value = {value}\n    return [value for _ in range(3)]\n");
+        assert!(diagnostics(&source, "SK801").is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn sk801_class_names_are_not_captured_as_function_locals() {
+    for expression in [
+        "lambda: value",
+        "(lambda: value)()",
+        "[value for _ in range(3)]",
+    ] {
+        let source = format!("class Owner:\n    value = 1\n    callback = {expression}\n");
+        assert!(diagnostics(&source, "SK801").is_empty(), "{source}");
+    }
+    for expression in ["lambda cached=value: cached", "[i for i in value]"] {
+        let source = format!("class Owner:\n    value = (1, 2)\n    callback = {expression}\n");
+        assert_eq!(diagnostics(&source, "SK801").len(), 1, "{source}");
+    }
 }

@@ -1808,8 +1808,11 @@ struct InlineEvaluationRegions<'a> {
     ast: &'a PythonAst,
     current: usize,
     next: usize,
+    class_body: bool,
+    function_body: bool,
     stores: HashMap<(usize, String), usize>,
     loads: HashMap<(usize, String), Vec<usize>>,
+    immutable_values: BTreeSet<(usize, String)>,
 }
 
 impl<'a> InlineEvaluationRegions<'a> {
@@ -1818,8 +1821,11 @@ impl<'a> InlineEvaluationRegions<'a> {
             ast,
             current: 0,
             next: 0,
+            class_body: false,
+            function_body: false,
             stores: HashMap::new(),
             loads: HashMap::new(),
+            immutable_values: BTreeSet::new(),
         };
         for stmt in &ast.suite {
             result.visit_stmt(stmt.clone());
@@ -1835,6 +1841,16 @@ impl<'a> InlineEvaluationRegions<'a> {
         self.current = previous;
     }
 
+    fn invocation(&mut self, visit: impl FnOnce(&mut Self)) {
+        let class = self.class_body;
+        let function = self.function_body;
+        self.class_body = false;
+        self.function_body = true;
+        self.separate(visit);
+        self.class_body = class;
+        self.function_body = function;
+    }
+
     fn same_execution(&self, assignment: usize, start: usize, end: usize, name: &str) -> bool {
         let Some(region) = self.stores.get(&(assignment, name.to_string())) else {
             return false;
@@ -1843,7 +1859,11 @@ impl<'a> InlineEvaluationRegions<'a> {
             .filter_map(|line| self.loads.get(&(line, name.to_string())))
             .flatten()
             .collect();
-        uses.len() == 1 && uses[0] == region
+        uses.len() == 1
+            && (uses[0] == region
+                || self
+                    .immutable_values
+                    .contains(&(assignment, name.to_string())))
     }
 
     fn defaults(&mut self, args: ast::Arguments) {
@@ -1890,6 +1910,15 @@ impl<'a> InlineEvaluationRegions<'a> {
 }
 
 impl Visitor for InlineEvaluationRegions<'_> {
+    fn visit_stmt_assign(&mut self, node: ast::StmtAssign) {
+        if let [Expr::Name(name)] = node.targets.as_slice() {
+            if self.function_body && !self.class_body && immutable_inline_value(&node.value) {
+                self.immutable_values
+                    .insert((self.ast.location_of(name).line, name.id.to_string()));
+            }
+        }
+        self.generic_visit_stmt_assign(node);
+    }
     fn visit_expr_name(&mut self, node: ast::ExprName) {
         let key = (self.ast.location_of(&node).line, node.id.to_string());
         match node.ctx {
@@ -1949,7 +1978,7 @@ impl Visitor for InlineEvaluationRegions<'_> {
         if let Some(annotation) = node.returns {
             self.separate(|visitor| visitor.visit_expr(*annotation));
         }
-        self.separate(|visitor| {
+        self.invocation(|visitor| {
             for stmt in node.body {
                 visitor.visit_stmt(stmt);
             }
@@ -1964,7 +1993,7 @@ impl Visitor for InlineEvaluationRegions<'_> {
         if let Some(annotation) = node.returns {
             self.separate(|visitor| visitor.visit_expr(*annotation));
         }
-        self.separate(|visitor| {
+        self.invocation(|visitor| {
             for stmt in node.body {
                 visitor.visit_stmt(stmt);
             }
@@ -1973,14 +2002,37 @@ impl Visitor for InlineEvaluationRegions<'_> {
 
     fn visit_expr_lambda(&mut self, node: ast::ExprLambda) {
         self.defaults(*node.args);
-        self.separate(|visitor| visitor.visit_expr(*node.body));
+        self.invocation(|visitor| visitor.visit_expr(*node.body));
+    }
+
+    fn visit_stmt_class_def(&mut self, node: ast::StmtClassDef) {
+        for base in node.bases {
+            self.visit_expr(base);
+        }
+        for keyword in node.keywords {
+            self.visit_expr(keyword.value);
+        }
+        for decorator in node.decorator_list {
+            self.visit_expr(decorator);
+        }
+        let previous_class = self.class_body;
+        let previous_function = self.function_body;
+        self.class_body = true;
+        self.function_body = false;
+        self.separate(|visitor| {
+            for stmt in node.body {
+                visitor.visit_stmt(stmt);
+            }
+        });
+        self.class_body = previous_class;
+        self.function_body = previous_function;
     }
 
     fn visit_expr_call(&mut self, node: ast::ExprCall) {
         if let Expr::Lambda(lambda) = node.func.as_ref() {
             let mut suspension = LambdaSuspension(false);
             suspension.visit_expr(*lambda.body.clone());
-            if !suspension.0 {
+            if self.function_body && !self.class_body && !suspension.0 {
                 self.defaults(*lambda.args.clone());
                 for arg in node.args {
                     self.visit_expr(arg);
@@ -2006,6 +2058,28 @@ impl Visitor for InlineEvaluationRegions<'_> {
     }
     fn visit_expr_generator_exp(&mut self, node: ast::ExprGeneratorExp) {
         self.comprehension(node.generators, vec![*node.elt]);
+    }
+}
+
+fn immutable_inline_value(value: &Expr) -> bool {
+    match value {
+        Expr::Constant(_) => true,
+        Expr::Tuple(tuple) => tuple.elts.iter().all(immutable_inline_value),
+        Expr::UnaryOp(unary) => match (&unary.op, unary.operand.as_ref()) {
+            (ast::UnaryOp::Not, operand) => immutable_inline_value(operand),
+            (ast::UnaryOp::UAdd | ast::UnaryOp::USub, Expr::Constant(value)) => matches!(
+                value.value,
+                ast::Constant::Int(_)
+                    | ast::Constant::Float(_)
+                    | ast::Constant::Complex { .. }
+                    | ast::Constant::Bool(_)
+            ),
+            (ast::UnaryOp::Invert, Expr::Constant(value)) => {
+                matches!(value.value, ast::Constant::Int(_) | ast::Constant::Bool(_))
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -2431,10 +2505,33 @@ impl ReturnTernaries<'_> {
             let Some(b) = &fallback.value else {
                 continue;
             };
+            // Preserve the rule's original eligibility. AST supplies complete
+            // operands and a complete terminal chain, but does not turn blank
+            // lines, multiline guards or multiline first returns into new
+            // diagnostics. A multiline fallback was already eligible and must
+            // be included in full by the fix.
+            let (last_branch, _) = branches.last().expect("at least one branch");
+            let anchor = self.ast.location_of(*last_branch);
+            let fallback_start = self.ast.location_of(fallback);
+            if fallback_start.line != anchor.line + 2 {
+                continue;
+            }
+            let if_line = &self.lines[anchor.line - 1];
+            let return_line = &self.lines[anchor.line];
+            let fallback_line = &self.lines[anchor.line + 1];
+            let trimmed_if = if_line.code.trim_start();
+            if !trimmed_if.starts_with("if ")
+                || !trimmed_if.ends_with(':')
+                || return_line.indent <= if_line.indent
+                || fallback_line.indent != if_line.indent
+                || !return_line.code.trim_start().starts_with("return ")
+                || !fallback_line.code.trim_start().starts_with("return ")
+            {
+                continue;
+            }
             covered = tail + 1;
             let start = self.ast.location_of(*branch);
             let end = self.ast.end_location_of(fallback);
-            let if_line = &self.lines[start.line - 1];
             let last = &self.lines[end.line - 1];
             let mut diagnostic = Diagnostic::new(
                 "SK802",
@@ -2443,8 +2540,8 @@ impl ReturnTernaries<'_> {
                 Span::new(
                     if_line.no,
                     if_line.indent + 1,
-                    last.no,
-                    last.text.chars().count() + 1,
+                    fallback_line.no,
+                    fallback_line.text.chars().count() + 1,
                 ),
                 "warning",
             );
@@ -2483,7 +2580,7 @@ impl ReturnTernaries<'_> {
                         safe: true,
                         message: "Collapse returns into a ternary".to_string(),
                         replacement: format!("{}return {expression}", " ".repeat(if_line.indent)),
-                        start_line: if_line.no,
+                        start_line: start.line,
                         start_column: 1,
                         end_line: end.line,
                         end_column: byte_to_column(&last.text, end.column - 1),
