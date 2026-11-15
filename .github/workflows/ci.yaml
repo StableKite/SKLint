@@ -6,6 +6,7 @@ on:
       - main
       - engineering/sk505-first-binding-v1
       - engineering/stdlib-exception-factory-v1
+      - engineering/safe-evaluation-fixes-v1
   workflow_dispatch:
     inputs:
       publish:
@@ -110,6 +111,7 @@ jobs:
         with:
           name: sklint-dist-windows-x86_64
           if-no-files-found: error
+          retention-days: 7
           path: |
             dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-win_amd64.whl
             dist/sklint-${{ env.PACKAGE_VERSION }}.tar.gz
@@ -118,6 +120,7 @@ jobs:
         with:
           name: sklint-vsix-windows-x86_64
           if-no-files-found: error
+          retention-days: 7
           path: dist/sklint-${{ env.PACKAGE_VERSION }}.vsix
 
   glibc_x86_64:
@@ -223,12 +226,14 @@ jobs:
         with:
           name: sklint-dist-glibc-x86_64
           if-no-files-found: error
+          retention-days: 7
           path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-manylinux_2_35_x86_64.whl
       - name: Upload Linux x86_64 VSIX
         uses: actions/upload-artifact@v7
         with:
           name: sklint-vsix-linux-x86_64
           if-no-files-found: error
+          retention-days: 7
           path: ${{ runner.temp }}/sklint-${{ env.PACKAGE_VERSION }}-linux-x86_64.vsix
 
   glibc_aarch64:
@@ -307,6 +312,7 @@ jobs:
         with:
           name: sklint-dist-glibc-aarch64
           if-no-files-found: error
+          retention-days: 7
           path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-manylinux_2_35_aarch64.whl
 
   musl_x86_64:
@@ -377,6 +383,7 @@ jobs:
         with:
           name: sklint-dist-musl-x86_64
           if-no-files-found: error
+          retention-days: 7
           path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-musllinux_1_2_x86_64.whl
 
   musl_aarch64:
@@ -447,6 +454,7 @@ jobs:
         with:
           name: sklint-dist-musl-aarch64
           if-no-files-found: error
+          retention-days: 7
           path: dist/sklint-${{ env.PACKAGE_VERSION }}-py3-none-musllinux_1_2_aarch64.whl
 
   publish:
@@ -514,6 +522,7 @@ jobs:
         with:
           name: sklint-publication-receipts
           if-no-files-found: warn
+          retention-days: 30
           path: |
             ${{ runner.temp }}/sklint-publication/**
             !${{ runner.temp }}/sklint-publication/consumer/**
