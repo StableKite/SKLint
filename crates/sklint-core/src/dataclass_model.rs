@@ -10,7 +10,7 @@ use crate::exception_values::{
     MemberTypes,
 };
 use crate::python_ast::{qualified_name, string_constant, PythonAst};
-use rustpython_parser::ast::{Expr, Stmt};
+use rustpython_parser::ast::{Expr, Ranged, Stmt};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -55,8 +55,11 @@ struct ExceptionMembers {
 }
 
 #[derive(Debug, Clone, Default)]
+// Import bindings and proven name-to-name module assignment aliases.
 struct Imports {
     aliases: HashMap<String, String>,
+    assignment_positions: HashMap<String, usize>,
+    unproven_bindings: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,28 +137,14 @@ impl DataclassModel {
             // A package re-export module can import hundreds of unrelated
             // modules. Follow only aliases for symbols that were actually
             // requested by a base/decorator/metaclass reference.
-            if raw.classes.is_empty() {
-                let symbols = requested.get(&module_name).cloned().unwrap_or_default();
-                for symbol in &symbols {
-                    let local = symbol.split('.').next().unwrap_or(symbol);
-                    if let Some(target) = raw.imports.aliases.get(local) {
-                        queue_symbol_reference(
-                            &root,
-                            target,
-                            &mut queued,
-                            &mut queue,
-                            &mut requested,
-                        );
-                    }
-                    if let Some(target) = raw.exception_imports.aliases.get(local) {
-                        queue_symbol_reference(
-                            &root,
-                            target,
-                            &mut queued,
-                            &mut queue,
-                            &mut requested,
-                        );
-                    }
+            let symbols = requested.get(&module_name).cloned().unwrap_or_default();
+            for symbol in &symbols {
+                let local = symbol.split('.').next().unwrap_or(symbol);
+                if let Some(target) = raw.imports.aliases.get(local) {
+                    queue_symbol_reference(&root, target, &mut queued, &mut queue, &mut requested);
+                }
+                if let Some(target) = raw.exception_imports.aliases.get(local) {
+                    queue_symbol_reference(&root, target, &mut queued, &mut queue, &mut requested);
                 }
             }
 
@@ -595,7 +584,9 @@ fn raw_module_from_ast(
         };
         if decorators.iter().any(|decorator| {
             qualified_name(decorator)
-                .map(|name| imports.resolve_symbol(&name, module_name))
+                .map(|name| {
+                    imports.resolve_symbol_at(&name, module_name, stmt.range().start().to_usize())
+                })
                 .is_some_and(|name| is_dataclass_transform_name(&name))
         }) {
             transform_providers.insert(qualify_local_symbol(module_name, name));
@@ -611,26 +602,28 @@ fn raw_module_from_ast(
         let name = class.name.to_string();
         let class_qualified_name = qualify_local_symbol(module_name, &name);
         let line = ast.location_of(class).line;
+        let position = class.range.start().to_usize();
         let bases = class
             .bases
             .iter()
             .filter_map(class_base_name)
-            .map(|name| imports.resolve_symbol(&name, module_name))
+            .map(|name| imports.resolve_symbol_at(&name, module_name, position))
             .collect::<Vec<_>>();
         let exception_bases = class
             .bases
             .iter()
             .filter_map(class_base_name)
             .map(|name| {
-                builtin_base(&exception_scope, &name)
-                    .unwrap_or_else(|| exception_imports.resolve_symbol(&name, module_name))
+                builtin_base(&exception_scope, &name).unwrap_or_else(|| {
+                    exception_imports.resolve_symbol_at(&name, module_name, position)
+                })
             })
             .collect();
         let decorators = class
             .decorator_list
             .iter()
             .filter_map(qualified_name)
-            .map(|name| imports.resolve_symbol(&name, module_name))
+            .map(|name| imports.resolve_symbol_at(&name, module_name, position))
             .collect::<Vec<_>>();
         let metaclass = class
             .keywords
@@ -642,7 +635,7 @@ fn raw_module_from_ast(
                     .is_some_and(|arg| arg.as_str() == "metaclass")
             })
             .and_then(|keyword| qualified_name(&keyword.value))
-            .map(|name| imports.resolve_symbol(&name, module_name));
+            .map(|name| imports.resolve_symbol_at(&name, module_name, position));
         let direct_fields = collect_direct_fields(source, ast, &class.body, &imports);
         let declared_attrs = collect_declared_attrs(&class.body);
         let provider_name = qualify_local_symbol(module_name, &name);
@@ -735,10 +728,102 @@ impl Imports {
                 _ => {}
             }
         }
-        Self { aliases }
+        let scope = annotation_scope(suite);
+        aliases.retain(|name, _| scope.has_single_binding(name));
+        let mut known = HashMap::new();
+        let mut assignment_positions = HashMap::new();
+        for stmt in suite {
+            match stmt {
+                Stmt::ClassDef(class) if scope.has_single_binding(class.name.as_str()) => {
+                    known.insert(
+                        class.name.to_string(),
+                        qualify_local_symbol(module_name, class.name.as_str()),
+                    );
+                }
+                Stmt::Import(import) => {
+                    for item in &import.names {
+                        let local = item
+                            .asname
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| {
+                                item.name
+                                    .as_str()
+                                    .split('.')
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_string()
+                            });
+                        if let Some(target) = aliases.get(&local) {
+                            known.insert(local, target.clone());
+                        }
+                    }
+                }
+                Stmt::ImportFrom(import) => {
+                    for item in &import.names {
+                        let local = item.asname.as_ref().unwrap_or(&item.name).to_string();
+                        if let Some(target) = aliases.get(&local) {
+                            known.insert(local, target.clone());
+                        }
+                    }
+                }
+                Stmt::Assign(assign) => {
+                    if let Some(target) = resolve_assignment_alias(&assign.value, &known) {
+                        for value in &assign.targets {
+                            if let Expr::Name(name) = value {
+                                if scope.has_single_binding(name.id.as_str()) {
+                                    let local = name.id.to_string();
+                                    assignment_positions
+                                        .insert(local.clone(), stmt.range().start().to_usize());
+                                    known.insert(local.clone(), target.clone());
+                                    aliases.insert(local, target.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let (Expr::Name(name), Some(value)) =
+                        (assign.target.as_ref(), assign.value.as_ref())
+                    {
+                        if scope.has_single_binding(name.id.as_str()) {
+                            if let Some(target) = resolve_assignment_alias(value, &known) {
+                                let local = name.id.to_string();
+                                assignment_positions
+                                    .insert(local.clone(), stmt.range().start().to_usize());
+                                known.insert(local.clone(), target.clone());
+                                aliases.insert(local, target);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            aliases,
+            assignment_positions,
+            unproven_bindings: scope.unproven_binding_names(),
+        }
+    }
+
+    fn resolve_symbol_at(&self, name: &str, module_name: &str, position: usize) -> String {
+        let head = name.split('.').next().unwrap_or(name);
+        if self
+            .assignment_positions
+            .get(head)
+            .is_some_and(|defined| *defined >= position)
+        {
+            return format!("<unproven-class-alias:{module_name}.{name}>");
+        }
+        self.resolve_symbol(name, module_name)
     }
 
     fn resolve_symbol(&self, name: &str, module_name: &str) -> String {
+        let head = name.split('.').next().unwrap_or(name);
+        if self.unproven_bindings.contains(head) {
+            return format!("<unproven-binding:{module_name}.{name}>");
+        }
         if let Some(exact) = self.aliases.get(name) {
             return exact.clone();
         }
@@ -751,6 +836,13 @@ impl Imports {
             return name.to_string();
         }
         qualify_local_symbol(module_name, name)
+    }
+}
+
+fn resolve_assignment_alias(expr: &Expr, known: &HashMap<String, String>) -> Option<String> {
+    match expr {
+        Expr::Name(name) => known.get(name.id.as_str()).cloned(),
+        _ => None,
     }
 }
 
@@ -835,10 +927,16 @@ fn queue_symbol_reference(
 fn resolve_project_symbol(name: &str, imports: &HashMap<String, Imports>) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();
-    while seen.insert(current.clone()) {
-        let Some((module, local, tail)) = split_at_known_module(&current, imports) else {
-            break;
-        };
+    while let Some((module, local, tail)) = split_at_known_module(&current, imports) {
+        if !seen.insert((module.to_string(), local.to_string())) {
+            return format!("<unproven-import-cycle:{current}>");
+        }
+        if imports
+            .get(module)
+            .is_some_and(|scope| scope.unproven_bindings.contains(local))
+        {
+            return format!("<unproven-binding:{current}>");
+        }
         let Some(target) = imports
             .get(module)
             .and_then(|module_imports| module_imports.aliases.get(local))
@@ -1289,6 +1387,121 @@ mod tests {
     fn model(source: &str) -> DataclassModel {
         let ast = PythonAst::parse(source, "example.py").expect("valid Python");
         DataclassModel::from_ast(source, &ast)
+    }
+
+    #[test]
+    fn assignment_class_aliases_preserve_inherited_attributes() {
+        let source = "class _Owner:\n    flag: bool\nPublic = _Owner\nAlias: type[_Owner] = Public\nclass Child(Alias):\n    pass\n";
+        assert!(model(source)
+            .effective_declared_attrs("Child")
+            .contains("flag"));
+    }
+
+    #[test]
+    fn unproven_class_aliases_do_not_supply_inherited_attributes() {
+        let prefix = "class _Owner:\n    flag: bool\nclass Other:\n    pass\n";
+        let cases = [
+            "Public = _Owner\nPublic = Other\nclass Child(Public):\n    pass\n",
+            "Public = _Owner\n_Owner = Other\nclass Child(Public):\n    pass\n",
+            "if condition:\n    Public = _Owner\nelse:\n    Public = Other\nclass Child(Public):\n    pass\n",
+            "class Child(Public):\n    pass\nPublic = _Owner\n",
+            "Public = factory()\nclass Child(Public):\n    pass\n",
+            "Public = Later\nLater = Public\nclass Child(Public):\n    pass\n",
+            "Public = _Owner\ndel Public\nclass Child(Public):\n    pass\n",
+            "Public = _Owner\n_Owner.flag = 1\nclass Child(Public):\n    pass\n",
+        ];
+        for suffix in cases {
+            assert!(
+                !model(&format!("{prefix}{suffix}"))
+                    .effective_declared_attrs("Child")
+                    .contains("flag"),
+                "unproven binding: {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_alias_cycles_stop_even_when_attribute_tails_grow() {
+        let imports = HashMap::from([
+            (
+                "a".to_string(),
+                Imports {
+                    aliases: HashMap::from([("Public".to_string(), "b.Public.extra".to_string())]),
+                    ..Imports::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                Imports {
+                    aliases: HashMap::from([("Public".to_string(), "a.Public.extra".to_string())]),
+                    ..Imports::default()
+                },
+            ),
+        ]);
+        assert!(resolve_project_symbol("a.Public", &imports).starts_with("<unproven-import-cycle:"));
+    }
+
+    #[test]
+    fn project_class_assignment_reexports_refresh_after_rebinding() {
+        let parent = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary parent");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = parent.join(format!("sklint-class-alias-{unique}"));
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.sklint]\nstrict = true\n",
+        )
+        .expect("project");
+        fs::write(
+            pkg.join("__init__.py"),
+            "from .facade import PublicOwner as PublicOwner\n",
+        )
+        .expect("package");
+        fs::write(pkg.join("owner.py"), "class _Owner:\n    flag: bool\n").expect("owner");
+        let facade = "from .owner import _Owner\nclass Unrelated:\n    pass\nAlias = _Owner\nPublicOwner = Alias\n";
+        let facade_path = pkg.join("facade.py");
+        fs::write(&facade_path, facade).expect("facade");
+        let source = "from . import PublicOwner\nclass Child(PublicOwner):\n    def run(self) -> None:\n        self.flag = True\n";
+        let child_path = pkg.join("child.py");
+        fs::write(&child_path, source).expect("child");
+        let ast = PythonAst::parse(source, &child_path.display().to_string()).expect("valid child");
+        let check = || {
+            DataclassModel::from_path(&child_path, source, &ast)
+                .effective_declared_attrs("Child")
+                .contains("flag")
+        };
+        assert!(check());
+        fs::write(
+            &facade_path,
+            format!("{facade}class Other:\n    pass\nPublicOwner = Other\n"),
+        )
+        .expect("rebound facade");
+        assert!(!check());
+        fs::write(&facade_path, facade).expect("restore facade");
+        assert!(check());
+        fs::write(
+            pkg.join("owner.py"),
+            "class _Owner:\n    flag: bool\nclass Other:\n    pass\n_Owner = Other\n",
+        )
+        .expect("rebound imported owner");
+        assert!(!check());
+        fs::write(pkg.join("owner.py"), "class _Owner:\n    flag: bool\n")
+            .expect("restore imported owner");
+        assert!(check());
+        let resolved = root.canonicalize().expect("own temporary root");
+        assert_eq!(resolved.parent(), Some(parent.as_path()));
+        assert!(resolved
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .starts_with("sklint-class-alias-"));
+        fs::remove_dir_all(resolved).expect("remove verified temporary root");
     }
 
     #[test]

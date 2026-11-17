@@ -33,6 +33,18 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
+    pub(crate) fn has_single_binding(&self, name: &str) -> bool {
+        self.proven(name).is_some()
+    }
+
+    pub(crate) fn unproven_binding_names(&self) -> HashSet<String> {
+        self.bindings
+            .keys()
+            .filter(|name| self.proven(name).is_none())
+            .cloned()
+            .collect()
+    }
+
     fn outer_args(&mut self, args: &ast::Arguments) {
         for arg in args
             .posonlyargs
