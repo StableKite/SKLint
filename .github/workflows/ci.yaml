@@ -7,12 +7,6 @@ on:
       - engineering/sk505-first-binding-v1
       - engineering/stdlib-exception-factory-v1
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish the validated version from the exact default branch
-        type: boolean
-        required: false
-        default: false
 
 concurrency:
   group: sklint-publication-${{ github.ref }}
@@ -477,14 +471,9 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python -I .github/scripts/ci_publish.py plan . "${{ runner.temp }}/sklint-publication"
-      - name: Validation only; authentication, collision checks and uploads are skipped
+      - name: Record validation-only run
         if: steps.release.outputs.should_publish != 'true'
         run: echo "Validation only. PLAN.json records the verified previous and current versions. No devpi credentials are used."
-      - name: Authenticated collision check with separate read credential
-        if: steps.release.outputs.should_publish == 'true'
-        env:
-          DEVPI_READ_TOKEN: ${{ secrets.DEVPI_READ_TOKEN }}
-        run: python -I .github/scripts/ci_publish.py collision . "${{ runner.temp }}/sklint-publication"
       - name: Download the original distributions from this run
         if: steps.release.outputs.should_publish == 'true'
         uses: actions/download-artifact@v8
@@ -503,11 +492,6 @@ jobs:
         env:
           DEVPI_TOKEN: ${{ secrets.DEVPI_TOKEN }}
         run: python -I .github/scripts/ci_publish.py upload . "${{ runner.temp }}/sklint-publication"
-      - name: Confirm exact published file names, sizes and server bytes using read credential
-        if: steps.release.outputs.should_publish == 'true'
-        env:
-          DEVPI_READ_TOKEN: ${{ secrets.DEVPI_READ_TOKEN }}
-        run: python -I .github/scripts/ci_publish.py confirm . "${{ runner.temp }}/sklint-publication"
       - name: Preserve publication plan and original failure evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -518,4 +502,3 @@ jobs:
             ${{ runner.temp }}/sklint-publication/**
             !${{ runner.temp }}/sklint-publication/consumer/**
             !${{ runner.temp }}/sklint-publication/distributions/**
-            !${{ runner.temp }}/sklint-publication/confirmed-downloads/**

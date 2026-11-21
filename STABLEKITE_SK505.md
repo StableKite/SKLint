@@ -16,22 +16,25 @@ musllinux delivery claims.
 All five existing platform jobs, including their audits, locked Rust gates,
 native provenance, wheel checks, installed smoke tests and Windows VSIX/sdist
 steps, are preserved. The sixth job records an explicit publication plan.
-Unchanged-version pushes validate without authentication or publication.
-Manual runs validate by default. Publication requires the exact default branch
-and either a verified version change or an explicit manual publish input.
-An unavailable or inconsistent previous push version fails closed.
+Unchanged-version pushes, manual dispatches and workflow reruns validate
+without devpi access. The first run of a default-branch push can publish an
+increased version. An unavailable previous version, a downgrade or a forced
+release update fails closed.
 
-Read authentication and collision checks use only DEVPI_READ_TOKEN. Upload uses
-only DEVPI_TOKEN. The endpoint is
-https://devpi.stablekite.com/StableKite/index/ with certificate verification and
-no redirect acceptance. The exact five wheel targets plus the canonical sdist
-must belong to the current successful run. Wheel metadata, complete RECORD
-hashes, native build provenance and a fresh installed consumer are checked before
-upload. Each original artifact receives one upload attempt; server file names,
-sizes and downloaded SHA256 values must then match the qualified originals.
-Missing credentials or a failed gate do not authorize a fallback publisher.
+CI uses only the write-only DEVPI_TOKEN, limited to the upload step. The
+endpoint is https://devpi.stablekite.com/StableKite/index/ with certificate
+verification and no redirect acceptance. The exact five wheel targets plus the
+canonical sdist must belong to the current successful run. Wheel metadata,
+complete RECORD hashes, native build provenance and an installed consumer are
+checked before upload. A receipt records the start of the upload and the HTTP
+acknowledgement, size and SHA-256 of each original. A failed or ambiguous upload
+requires inspection before manual recovery.
 
-Offline failure controls exercise publication intent, all five dependencies,
-run/head binding, previous-version validation, credential separation, TLS and
-endpoint restrictions, authenticated absence, version collisions, native
-provenance and corrupt or incomplete artifacts. They make no production calls.
+The local collision and confirm commands can use a separately authorized read
+credential. Confirmation downloads and checks the exact file names, sizes and
+SHA-256 values. A successful CI upload receipt records that server bytes have
+yet to be checked independently.
+
+Offline tests exercise publication intent, all five dependencies, run and
+checkout binding, credential separation, endpoint restrictions, native
+provenance, incomplete artifacts and the write-only upload path.

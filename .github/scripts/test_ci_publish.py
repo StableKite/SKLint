@@ -8,9 +8,11 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 import zipfile
 
 spec = importlib.util.spec_from_file_location('sklint_publish', Path(__file__).with_name('ci_publish.py'))
@@ -45,7 +47,7 @@ class ReleaseControls(unittest.TestCase):
 
     def test_changed_default_push_publishes(self):
         self.assertEqual(release.release_decision('push', 'refs/heads/master', 'master', '1.2', '1.3'),
-                         (True, 'version-change'))
+                         (True, 'version-increase'))
 
     def test_all_publication_phases_refuse_validation_only(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -130,15 +132,24 @@ class ReleaseControls(unittest.TestCase):
                 with self.subTest(relative=relative), self.assertRaises(ValueError):
                     release.safe_file(root, relative)
 
-    def test_manual_requires_explicit_input_and_exact_default(self):
-        self.assertFalse(release.release_decision('workflow_dispatch', 'refs/heads/main', 'main', None, '1.2')[0])
-        self.assertTrue(release.release_decision('workflow_dispatch', 'refs/heads/main', 'main', None, '1.2', True)[0])
-        for event, ref in [('push', 'refs/heads/feature'), ('workflow_dispatch', 'refs/heads/feature'),
-                           ('push', 'refs/heads/Main')]:
+    def test_manual_and_nondefault_runs_only_validate(self):
+        for event, ref in [('workflow_dispatch', 'refs/heads/main'),
+                           ('push', 'refs/heads/feature'), ('push', 'refs/heads/Main')]:
             with self.subTest(event=event, ref=ref):
-                self.assertFalse(release.release_decision(event, ref, 'main', '1.1', '1.2', True)[0])
+                self.assertEqual(release.release_decision(event, ref, 'main', '1.1', '1.2'),
+                                 (False, 'validation-only'))
         with self.assertRaises(ValueError):
             release.release_decision('pull_request', 'refs/pull/1/merge', 'main', None, '1.2')
+
+    def test_rerun_of_a_version_increase_cannot_publish(self):
+        self.assertEqual(release.release_decision('push', 'refs/heads/main', 'main', '1.2', '1.3', '2'),
+                         (False, 'rerun-validation-only'))
+        with self.assertRaisesRegex(ValueError, 'Invalid run attempt'):
+            release.release_decision('push', 'refs/heads/main', 'main', '1.2', '1.3', '0')
+
+    def test_default_branch_cannot_publish_a_downgrade(self):
+        with self.assertRaisesRegex(ValueError, 'must not decrease'):
+            release.release_decision('push', 'refs/heads/main', 'main', '1.10', '1.9')
 
     def test_all_five_original_gates_are_mandatory(self):
         good = {name: {'result': 'success', 'outputs': {}} for name in release.PRODUCERS}
@@ -242,7 +253,7 @@ class ReleaseControls(unittest.TestCase):
         head = 'a' * 40
         plan = {'should_publish': True, 'git_head': head, 'repository': 'StableKite/SKLint',
                 'run_id': '100', 'run_attempt': '1', 'ref': 'refs/heads/main', 'default_branch': 'main',
-                'current_version': '1.2', 'endpoint': release.INDEX,
+                'event': 'push', 'previous_version': '1.1', 'current_version': '1.2', 'endpoint': release.INDEX,
                 'producers': {name: {'result': 'success'} for name in release.PRODUCERS}}
         env = {'GITHUB_SHA': head, 'GITHUB_REPOSITORY': 'StableKite/SKLint', 'GITHUB_REF': 'refs/heads/main',
                'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1'}
@@ -257,6 +268,70 @@ class ReleaseControls(unittest.TestCase):
                     release.checked_plan(root, root)
             with patch.object(release, 'git', return_value=' M setup.py'), self.assertRaises(ValueError):
                 release.clean_source(root)
+
+    def test_validation_starts_without_collision_receipt_or_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = {'current_version': '1.2', 'git_head': 'a' * 40}
+            sentinel = RuntimeError('Reached artifact validation')
+            with patch.dict(os.environ, {}, clear=True), patch.object(release, 'checked_plan', return_value=plan), \
+                 patch.object(release, 'collect_artifacts', side_effect=sentinel) as collect, \
+                 patch('requests.Session') as session, self.assertRaisesRegex(RuntimeError, str(sentinel)):
+                release.validate_release(root, root, root)
+            collect.assert_called_once_with(root, root, '1.2', 'a' * 40)
+            session.assert_not_called()
+
+    def test_upload_only_needs_write_token_and_never_retries_or_reads_back(self):
+        for status in (200, 503):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                head = 'a' * 40
+                plan = {'current_version': '1.2', 'git_head': head, 'default_branch': 'main'}
+                release.write(root / 'PLAN.json', plan)
+                distributions = root / 'distributions'
+                distributions.mkdir()
+                files = []
+                for target in (*release.TARGETS, 'canonical-source'):
+                    path = distributions / (target + '.dist')
+                    path.write_bytes(target.encode())
+                    files.append({'target': target, 'sha256': release.sha(path),
+                                  'bytes': path.stat().st_size, 'path': str(path)})
+                release.write(root / 'PUBLISH_SET.json', {
+                    'status': 'PASS_EXACT_FIVE_PLATFORM_SET_AND_INTEGRATION',
+                    'git_head': head, 'version': '1.2', 'files': files,
+                    'plan_sha256': release.sha(root / 'PLAN.json'),
+                })
+                repository = Mock()
+                repository.upload.return_value = SimpleNamespace(status_code=status, history=[], url=release.INDEX)
+                twine = ModuleType('twine')
+                package_module = ModuleType('twine.package')
+                package_module.PackageFile = SimpleNamespace(from_filename=Mock(side_effect=lambda path, _: path))
+                repository_module = ModuleType('twine.repository')
+                repository_module.Repository = Mock(return_value=repository)
+                modules = {'twine': twine, 'twine.package': package_module, 'twine.repository': repository_module}
+                with patch.dict(os.environ, {'DEVPI_TOKEN': 'offline-write-only'}, clear=True), \
+                     patch.dict(sys.modules, modules), patch.object(release, 'checked_plan', return_value=plan), \
+                     patch.object(release, 'git', return_value=head + '\trefs/heads/main'), \
+                     patch('requests.Session') as session:
+                    if status == 200:
+                        release.upload_release(root, root)
+                        uploaded = release.read(root / 'UPLOAD.json')
+                        self.assertEqual(uploaded['status'], 'PASS_UPLOAD_HTTP_200_ALL_FILES')
+                        self.assertFalse(uploaded['server_bytes_verified'])
+                        self.assertEqual(len(uploaded['files']), 6)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'Upload failed'):
+                            release.upload_release(root, root)
+                        self.assertFalse((root / 'UPLOAD.json').exists())
+                    self.assertTrue((root / 'UPLOAD_STARTED.json').is_file())
+                    with self.assertRaisesRegex(ValueError, 'upload receipt already exists'):
+                        release.upload_release(root, root)
+                    repository_module.Repository.assert_called_once_with(
+                        release.INDEX, '', 'offline-write-only', disable_progress_bar=True)
+                    self.assertEqual(repository.upload.call_count, 6 if status == 200 else 1)
+                    for call in repository.upload.call_args_list:
+                        self.assertEqual(call.kwargs, {'max_redirects': 1})
+                    session.assert_not_called()
 
     def make_wheel(self, path, head='a' * 40, dirty='false', corrupt_record=False):
         info = {'version': '1.2', 'revision': 'v1.2', 'source_commit': head, 'source_dirty': dirty,

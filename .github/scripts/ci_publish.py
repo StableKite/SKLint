@@ -1,4 +1,4 @@
-"""Fail-closed sixth-job publisher; read and write credentials never share a phase."""
+"""Publish with a write-only credential and support independent local readback."""
 from pathlib import Path, PurePosixPath
 import argparse
 import ast
@@ -176,9 +176,8 @@ def upload_release(source, out):
     manifest = read(out / 'PUBLISH_SET.json')
     require(manifest['status'] == 'PASS_EXACT_FIVE_PLATFORM_SET_AND_INTEGRATION' and
             manifest['plan_sha256'] == sha(out / 'PLAN.json') and
-            manifest['collision_sha256'] == sha(out / 'COLLISION.json') and
             manifest['git_head'] == plan['git_head'] and manifest['version'] == plan['current_version'],
-            'Publish set is not bound to the reviewed plan/preflight.')
+            'Publish set is not bound to the validated plan.')
     require('DEVPI_READ_TOKEN' not in os.environ, 'Read credential is forbidden in upload phase.')
     token = os.environ.get('DEVPI_TOKEN', '')
     require(bool(token), 'Upload credential missing.')
@@ -200,6 +199,13 @@ def upload_release(source, out):
             kwargs['timeout'] = (10, 90)
             return super().send(request, **kwargs)
 
+    require(not (out / 'UPLOAD_STARTED.json').exists() and not (out / 'UPLOAD.json').exists()
+            and not any(out.glob('UPLOADED-*.json')),
+            'An upload receipt already exists; inspect devpi before any recovery.')
+    manifest_hash = sha(out / 'PUBLISH_SET.json')
+    write(out / 'UPLOAD_STARTED.json', {'git_head': plan['git_head'],
+          'version': plan['current_version'], 'publish_set_sha256': manifest_hash})
+
     repository = Repository(INDEX, '', token, disable_progress_bar=True)
     repository.session.trust_env = False
     repository.session.verify = True
@@ -216,8 +222,10 @@ def upload_release(source, out):
             write(out / ('UPLOADED-' + path.name + '.json'), uploaded[-1])
     finally:
         repository.close()
-    write(out / 'UPLOAD.json', {'status': 'UPLOADED_CONFIRMATION_STILL_REQUIRED',
-          'git_head': plan['git_head'], 'files': uploaded, 'publish_set_sha256': sha(out / 'PUBLISH_SET.json')})
+    write(out / 'UPLOAD.json', {'status': 'PASS_UPLOAD_HTTP_200_ALL_FILES',
+          'git_head': plan['git_head'], 'version': plan['current_version'],
+          'files': uploaded, 'publish_set_sha256': manifest_hash,
+          'server_bytes_verified': False})
 
 
 def confirm_release(source, out):
@@ -252,7 +260,7 @@ def confirm_release(source, out):
             require(count == item['bytes'] and sha(destination / name) == item['sha256'],
                     'Published server bytes differ from qualified originals.')
             records.append({'name': name, 'sha256': item['sha256'], 'bytes': count, 'url': link['href']})
-    write(out / 'RESULT.json', {'status': 'PASS_AUTH_COLLISION_INTEGRATION_EXACT_SET_UPLOAD_AND_SERVER_BYTES',
+    write(out / 'RESULT.json', {'status': 'PASS_UPLOAD_AND_SERVER_BYTES',
           'git_head': plan['git_head'], 'version': plan['current_version'], 'files': records,
           'confirmed_utc': datetime.now(timezone.utc).isoformat()})
 
@@ -281,15 +289,20 @@ def previous_version(source, commit):
                         git(source, 'show', commit + ':python/sklint/__init__.py'))
 
 
-def release_decision(event_name, ref, default, previous, current, manual=False):
+def release_decision(event_name, ref, default, previous, current, attempt='1'):
+    from packaging.version import Version
     require(event_name in ('push', 'workflow_dispatch'), 'Unexpected publication event.')
-    on_default = ref == 'refs/heads/' + default
-    publish = on_default and ((event_name == 'workflow_dispatch' and manual) or
-                             (event_name == 'push' and previous != current))
-    reason = ('explicit-manual-default-publish' if publish and event_name == 'workflow_dispatch'
-              else 'version-change' if publish else 'unchanged-version' if
-              event_name == 'push' and previous == current else 'validation-only')
-    return publish, reason
+    require(re.fullmatch('[1-9][0-9]*', attempt) is not None, 'Invalid run attempt.')
+    if event_name != 'push' or ref != 'refs/heads/' + default:
+        return False, 'validation-only'
+    require(isinstance(previous, str), 'A verified previous version is required.')
+    previous, current = Version(previous), Version(current)
+    if current == previous:
+        return False, 'unchanged-version'
+    require(current > previous, 'The default-branch version must not decrease.')
+    if attempt != '1':
+        return False, 'rerun-validation-only'
+    return True, 'version-increase'
 
 
 def successful_producers(value):
@@ -318,14 +331,13 @@ def plan_release(source, out):
     current = source_version(source)
     previous = (previous_version(source, event['before'])
                 if event_name == 'push' and ref == 'refs/heads/' + default else None)
-    manual_value = event.get('inputs', {}).get('publish', 'false')
-    require(manual_value in (True, False, 'true', 'false'), 'Invalid manual publish input.')
-    manual = manual_value is True or manual_value == 'true'
-    publish, reason = release_decision(event_name, ref, default, previous, current, manual)
+    attempt = os.environ['GITHUB_RUN_ATTEMPT']
+    publish, reason = release_decision(event_name, ref, default, previous, current, attempt)
+    require(not publish or not event.get('forced', False), 'A forced update cannot publish.')
     result = {'status': 'PUBLISH_PLANNED' if publish else 'PASS_VALIDATION_ONLY_NO_REPUBLISH',
               'git_head': head, 'repository': 'StableKite/SKLint', 'default_branch': default,
               'event': event_name, 'ref': ref, 'run_id': os.environ['GITHUB_RUN_ID'],
-              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'previous_version': previous,
+              'run_attempt': attempt, 'previous_version': previous,
               'current_version': current, 'should_publish': publish, 'reason': reason,
               'producers': successful_producers(json.loads(os.environ['NEEDS_JSON'])),
               'runtime': runtime_policy(), 'endpoint': INDEX}
@@ -347,6 +359,9 @@ def checked_plan(source, out):
             'Publication must use the exact default branch.')
     require(plan['current_version'] == source_version(source) and plan['endpoint'] == INDEX,
             'Publication metadata changed after planning.')
+    publish, _ = release_decision(plan['event'], plan['ref'], plan['default_branch'],
+                                  plan['previous_version'], plan['current_version'], plan['run_attempt'])
+    require(publish, 'Only the first run of a default-branch version increase can publish.')
     successful_producers(plan['producers'])
     clean_source(source)
     return plan
@@ -438,10 +453,6 @@ def collect_artifacts(source, artifacts, version, head):
 
 def validate_release(source, out, artifacts):
     plan = checked_plan(source, out)
-    collision = read(out / 'COLLISION.json')
-    require(collision['status'] == 'PASS_AUTHENTICATED_COLLISION_CHECK' and
-            collision['git_head'] == plan['git_head'] and collision['version'] == plan['current_version']
-            and collision['endpoint'] == INDEX, 'Missing exact-head collision preflight.')
     records = collect_artifacts(source, artifacts, plan['current_version'], plan['git_head'])
     run_logged(out, 'original-exact-set', [sys.executable, '-I', source / '.github/scripts/ci_sklint.py',
         'verify-publish-set', '--dir', artifacts], source, 60)
@@ -472,7 +483,7 @@ def validate_release(source, out, artifacts):
         require(sha(path) == item['sha256'], 'Staged artifact differs.')
         item['path'] = str(path)
     write(out / 'PUBLISH_SET.json', {'status': 'PASS_EXACT_FIVE_PLATFORM_SET_AND_INTEGRATION',
-        'plan_sha256': sha(out / 'PLAN.json'), 'collision_sha256': sha(out / 'COLLISION.json'),
+        'plan_sha256': sha(out / 'PLAN.json'),
         'git_head': plan['git_head'], 'version': plan['current_version'], 'files': records})
 
 
