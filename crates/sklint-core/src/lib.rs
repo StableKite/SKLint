@@ -17,6 +17,7 @@ mod exception_factories;
 mod exception_values;
 pub mod formatter;
 mod identifier;
+mod lazy_imports;
 pub mod magic_constants;
 #[cfg(test)]
 mod pep758_tests;
@@ -25,6 +26,7 @@ pub mod pydoclint;
 pub mod pydoclint_doc;
 pub mod python_ast;
 pub mod rules;
+mod strong_cycles;
 pub mod suppression;
 pub mod syntax_rules;
 

@@ -190,6 +190,18 @@ pub const ALL_RULES: &[Rule] = &[
         summary: "contextlib.suppress is forbidden in strict mode because it hides exceptional control flow like try/except",
     },
     Rule {
+        code: "SK511",
+        name: "LazyImportsForbidden",
+        level: RuleLevel::Strict,
+        summary: "Lazy imports and module assignments to __lazy_modules__ are forbidden in strict mode",
+    },
+    Rule {
+        code: "SK512",
+        name: "StrongReferenceCycle",
+        level: RuleLevel::Strict,
+        summary: "Detect proven strong reference cycles with no proven cleanup",
+    },
+    Rule {
         code: "SK507",
         name: "RaiseHotPath",
         level: RuleLevel::Normal,

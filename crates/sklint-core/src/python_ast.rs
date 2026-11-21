@@ -110,6 +110,15 @@ impl PythonAst {
         }
     }
 
+    pub(crate) fn scalar_location_of_offset(&self, source: &str, offset: usize) -> SourceLocation {
+        let location = self.location_of_offset(offset);
+        let line_start = offset - (location.column - 1);
+        SourceLocation {
+            line: location.line,
+            column: source[line_start..offset].chars().count() + 1,
+        }
+    }
+
     pub fn location_of<T: Ranged>(&self, node: &T) -> SourceLocation {
         self.location_of_offset(text_size_to_usize(node.start()))
     }

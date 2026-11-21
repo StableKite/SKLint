@@ -518,8 +518,16 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
         }
     }
 
-    if PythonAst::parse(source, &display_path).is_err() {
-        match cpython_syntax_status(source) {
+    match PythonAst::parse(source, &display_path) {
+        Ok(ast) => {
+            if config.is_enabled("SK512") {
+                diagnostics.extend(crate::strong_cycles::check(&ast, source, &display_path));
+            }
+            if config.is_enabled("SK511") {
+                diagnostics.extend(crate::lazy_imports::check(ast, source, &display_path));
+            }
+        }
+        Err(_) => match cpython_syntax_status(source) {
             SyntaxOracleStatus::Valid if config.is_enabled("SK902") => diagnostics.push(
                 Diagnostic::new(
                     "SK902",
@@ -539,7 +547,7 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
                 ),
             ),
             _ => {}
-        }
+        },
     }
 
     diagnostics.extend(run_comment_rules(path, source, config));

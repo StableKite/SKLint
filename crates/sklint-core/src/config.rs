@@ -203,9 +203,10 @@ fn active_codes(strict: bool, select: &[String], ignore: &[String]) -> Vec<Strin
     }
 
     enabled.retain(|code| {
-        !ignore
-            .iter()
-            .any(|selector| code_matches_selector(code, selector))
+        (strict || !matches!(code.as_str(), "SK511" | "SK512"))
+            && !ignore
+                .iter()
+                .any(|selector| code_matches_selector(code, selector))
     });
     enabled.sort();
     enabled

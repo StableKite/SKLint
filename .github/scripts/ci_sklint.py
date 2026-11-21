@@ -179,10 +179,12 @@ def invoke(callback: Callable[[], None]) -> int:
                     capture_output=True, text=True,
                 )
                 diagnostics = json.loads(checked.stdout)["diagnostics"]
-                expected = [] if value == "_RESULT" else ["SK901"]
+                expected = ["SK511"] if modifier else []
+                if value == "41":
+                    expected.append("SK901")
                 if [entry["code"] for entry in diagnostics] != expected:
                     raise SystemExit(f"PEP 810 full AST/control mismatch: {diagnostics}")
-                if checked.returncode != int(value == "41"):
+                if checked.returncode != int(bool(expected)):
                     raise SystemExit("PEP 810 installed CLI returned the wrong status")
         path = root / "template.py"
         source = 'name = "actual"\nvalue = t"{name}"\n'
