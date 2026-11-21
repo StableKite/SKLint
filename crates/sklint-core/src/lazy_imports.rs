@@ -1,7 +1,7 @@
 use crate::diagnostic::{Diagnostic, Span};
 use crate::python_ast::PythonAst;
 use rustpython_ast::Visitor;
-use rustpython_parser::ast::{self, Expr, Ranged};
+use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::text_size::TextRange;
 
 pub(crate) fn check(mut ast: PythonAst, source: &str, path: &str) -> Vec<Diagnostic> {
@@ -11,6 +11,7 @@ pub(crate) fn check(mut ast: PythonAst, source: &str, path: &str) -> Vec<Diagnos
         source,
         path,
         diagnostics: Vec::new(),
+        module_binding: true,
     };
     for import in &ast.lazy_imports {
         rule.report(
@@ -29,6 +30,7 @@ struct LazyImports<'a> {
     source: &'a str,
     path: &'a str,
     diagnostics: Vec<Diagnostic>,
+    module_binding: bool,
 }
 
 impl LazyImports<'_> {
@@ -49,54 +51,147 @@ impl LazyImports<'_> {
         (location.line, location.column)
     }
 
-    fn check_target(&mut self, target: &Expr) {
-        match target {
-            Expr::Name(name) if name.id.as_str() == "__lazy_modules__" => self.report(
-                name.range(),
-                "Module assignments to `__lazy_modules__` are forbidden in strict mode",
-            ),
-            Expr::Tuple(tuple) => {
-                for item in &tuple.elts {
-                    self.check_target(item);
-                }
-            }
-            Expr::List(list) => {
-                for item in &list.elts {
-                    self.check_target(item);
-                }
-            }
-            Expr::Starred(starred) => self.check_target(&starred.value),
-            _ => {}
+    fn scope(&mut self, body: Vec<ast::Stmt>) {
+        let outer = self.module_binding;
+        self.module_binding = body.iter().any(declares_global);
+        for statement in body {
+            self.visit_stmt(statement);
         }
+        self.module_binding = outer;
     }
 }
 
+fn declares_global(stmt: &ast::Stmt) -> bool {
+    use ast::Stmt;
+    match stmt {
+        Stmt::Global(node) => node
+            .names
+            .iter()
+            .any(|name| name.as_str() == "__lazy_modules__"),
+        Stmt::If(node) => node.body.iter().chain(&node.orelse).any(declares_global),
+        Stmt::For(node) => node.body.iter().chain(&node.orelse).any(declares_global),
+        Stmt::AsyncFor(node) => node.body.iter().chain(&node.orelse).any(declares_global),
+        Stmt::While(node) => node.body.iter().chain(&node.orelse).any(declares_global),
+        Stmt::With(node) => node.body.iter().any(declares_global),
+        Stmt::AsyncWith(node) => node.body.iter().any(declares_global),
+        Stmt::Try(node) => {
+            declares_global_in_try(&node.body, &node.handlers, &node.orelse, &node.finalbody)
+        }
+        Stmt::TryStar(node) => {
+            declares_global_in_try(&node.body, &node.handlers, &node.orelse, &node.finalbody)
+        }
+        Stmt::Match(node) => node
+            .cases
+            .iter()
+            .any(|case| case.body.iter().any(declares_global)),
+        _ => false,
+    }
+}
+
+fn declares_global_in_try(
+    body: &[ast::Stmt],
+    handlers: &[ast::ExceptHandler],
+    orelse: &[ast::Stmt],
+    finalbody: &[ast::Stmt],
+) -> bool {
+    body.iter()
+        .chain(orelse)
+        .chain(finalbody)
+        .any(declares_global)
+        || handlers.iter().any(|handler| {
+            let ast::ExceptHandler::ExceptHandler(handler) = handler;
+            handler.body.iter().any(declares_global)
+        })
+}
+
 impl Visitor for LazyImports<'_> {
-    fn visit_stmt_assign(&mut self, node: ast::StmtAssign) {
-        for target in &node.targets {
-            self.check_target(target);
+    fn visit_expr_name(&mut self, node: ast::ExprName) {
+        if self.module_binding
+            && node.ctx == ast::ExprContext::Store
+            && node.id.as_str() == "__lazy_modules__"
+        {
+            self.report(
+                node.range(),
+                "Module bindings of `__lazy_modules__` are forbidden in strict mode",
+            );
         }
     }
 
     fn visit_stmt_ann_assign(&mut self, node: ast::StmtAnnAssign) {
-        if node.value.is_some() {
-            self.check_target(&node.target);
+        if let Some(value) = node.value {
+            self.visit_expr(*node.target);
+            self.visit_expr(*value);
         }
     }
 
-    fn visit_stmt_aug_assign(&mut self, node: ast::StmtAugAssign) {
-        self.check_target(&node.target);
+    fn visit_stmt_function_def(&mut self, node: ast::StmtFunctionDef) {
+        self.visit_arguments(*node.args);
+        for decorator in node.decorator_list {
+            self.visit_expr(decorator);
+        }
+        self.scope(node.body);
     }
 
-    // Walk suites in the module's scope. Function and class bodies create
-    // separate namespaces, and expressions do not declare the module setting.
-    fn visit_stmt_function_def(&mut self, _: ast::StmtFunctionDef) {}
-    fn visit_stmt_async_function_def(&mut self, _: ast::StmtAsyncFunctionDef) {}
-    fn visit_stmt_class_def(&mut self, _: ast::StmtClassDef) {}
-    fn visit_expr(&mut self, _: Expr) {}
+    fn visit_stmt_async_function_def(&mut self, node: ast::StmtAsyncFunctionDef) {
+        self.visit_arguments(*node.args);
+        for decorator in node.decorator_list {
+            self.visit_expr(decorator);
+        }
+        self.scope(node.body);
+    }
 
-    // RustPython's default visitor does not descend into match cases.
+    fn visit_stmt_class_def(&mut self, node: ast::StmtClassDef) {
+        for expr in node.bases.into_iter().chain(node.decorator_list) {
+            self.visit_expr(expr);
+        }
+        for keyword in node.keywords {
+            self.visit_keyword(keyword);
+        }
+        self.scope(node.body);
+    }
+
+    fn visit_expr_lambda(&mut self, node: ast::ExprLambda) {
+        self.visit_arguments(*node.args);
+        // The body belongs to the lambda, which cannot declare a global.
+    }
+
+    fn visit_arguments(&mut self, args: ast::Arguments) {
+        for parameter in args
+            .posonlyargs
+            .into_iter()
+            .chain(args.args)
+            .chain(args.kwonlyargs)
+        {
+            if let Some(default) = parameter.default {
+                self.visit_expr(*default);
+            }
+        }
+    }
+
+    fn visit_comprehension(&mut self, comprehension: ast::Comprehension) {
+        // The iteration target is local to the comprehension. A walrus in
+        // its expressions binds in the containing scope.
+        self.visit_expr(comprehension.iter);
+        for condition in comprehension.ifs {
+            self.visit_expr(condition);
+        }
+    }
+
+    fn visit_keyword(&mut self, keyword: ast::Keyword) {
+        self.visit_expr(keyword.value);
+    }
+
+    fn visit_withitem(&mut self, item: ast::WithItem) {
+        self.visit_expr(item.context_expr);
+        if let Some(variable) = item.optional_vars {
+            self.visit_expr(*variable);
+        }
+    }
+
     fn visit_match_case(&mut self, case: ast::MatchCase) {
+        if let Some(guard) = case.guard {
+            self.visit_expr(*guard);
+        }
         for statement in case.body {
             self.visit_stmt(statement);
         }
@@ -201,6 +296,41 @@ def local():
             assert!(!report.config.is_enabled("SK511"));
             assert!(report.diagnostics.iter().all(|d| d.code != "SK511"));
         }
+    }
+
+    #[test]
+    fn reports_walrus_loop_target_and_explicit_global_stores() {
+        let source = r#"(__lazy_modules__ := ("fractions",))
+for __lazy_modules__ in [("decimal",)]:
+    pass
+
+def configure():
+    if enabled:
+        global __lazy_modules__
+    __lazy_modules__ = ("math",)
+
+results = [(__lazy_modules__ := value) for value in values]
+"#;
+        let found: Vec<_> = warnings(source)
+            .into_iter()
+            .map(|d| (d.line, d.column))
+            .collect();
+        assert_eq!(found, [(1, 2), (2, 5), (8, 5), (10, 13)]);
+    }
+
+    #[test]
+    fn does_not_treat_comprehension_and_nested_scope_targets_as_global() {
+        let source = r#"results = [__lazy_modules__ for __lazy_modules__ in values]
+setter = lambda: (__lazy_modules__ := ("local",))
+
+def function():
+    for __lazy_modules__ in values:
+        pass
+    class Local:
+        __lazy_modules__ = ("class",)
+    return Local
+"#;
+        assert!(warnings(source).is_empty());
     }
 
     #[test]

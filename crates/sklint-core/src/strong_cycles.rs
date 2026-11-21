@@ -4,12 +4,18 @@ use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt};
 use rustpython_parser::text_size::TextRange;
 use std::collections::{HashMap, HashSet};
 
-pub(crate) fn check(ast: &PythonAst, source: &str, path: &str) -> Vec<Diagnostic> {
+pub(crate) fn check(
+    ast: &PythonAst,
+    source: &str,
+    path: &str,
+    opt_in_fixes: bool,
+) -> Vec<Diagnostic> {
     let mut analysis = Analysis {
         ast,
         source,
         path,
         diagnostics: Vec::new(),
+        opt_in_fixes,
     };
     analysis.suite(&ast.suite, Flow::default(), false);
     analysis.diagnostics
@@ -32,20 +38,37 @@ struct Object<'a> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+enum Referent {
+    Object(ObjectId),
+    Cell(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct Reference {
-    object: ObjectId,
+    target: Referent,
     via: Option<String>,
-    cell: Option<String>,
 }
 
 impl Reference {
     fn direct(object: ObjectId) -> Self {
         Self {
-            object,
+            target: Referent::Object(object),
             via: None,
-            cell: None,
         }
     }
+
+    fn direct_object(&self) -> Option<ObjectId> {
+        match (&self.target, &self.via) {
+            (Referent::Object(id), None) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Event {
+    order: usize,
+    range: TextRange,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -70,16 +93,26 @@ struct Edge {
     owner: ObjectId,
     slot: Slot,
     reference: Reference,
-    range: TextRange,
+    event: Event,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContextlibBinding {
+    Module,
+    ExitStack,
 }
 
 #[derive(Clone, Default)]
 struct Flow<'a> {
     classes: HashMap<String, &'a ast::StmtClassDef>,
+    contextlib: HashMap<String, ContextlibBinding>,
+    int_shadowed: bool,
     variables: HashMap<String, Reference>,
     objects: Vec<Object<'a>>,
     edges: Vec<Edge>,
-    local: bool,
+    bindings: HashMap<String, Event>,
+    next_order: usize,
+    local_body: Option<&'a [Stmt]>,
 }
 
 fn name(expr: &Expr) -> Option<&str> {
@@ -89,14 +122,24 @@ fn name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn index(expr: &Expr) -> Option<usize> {
-    match expr {
-        Expr::Constant(node) => match &node.value {
-            Constant::Int(value) => value.to_string().parse().ok(),
-            _ => None,
-        },
-        _ => None,
-    }
+fn list_index(expr: &Expr, len: usize) -> Option<usize> {
+    let (operand, negative) = match expr {
+        Expr::UnaryOp(node) if node.op == ast::UnaryOp::USub => (node.operand.as_ref(), true),
+        _ => (expr, false),
+    };
+    let Expr::Constant(node) = operand else {
+        return None;
+    };
+    let Constant::Int(value) = &node.value else {
+        return None;
+    };
+    let magnitude: usize = value.to_string().parse().ok()?;
+    let index = if negative && magnitude != 0 {
+        len.checked_sub(magnitude)?
+    } else {
+        magnitude
+    };
+    (index < len).then_some(index)
 }
 
 fn plain_class(class: &ast::StmtClassDef) -> bool {
@@ -181,22 +224,20 @@ impl<'a> Flow<'a> {
     }
 
     fn object(&self, expr: &Expr) -> Option<ObjectId> {
-        let reference = self.variables.get(name(expr)?)?;
-        reference.via.is_none().then_some(reference.object)
+        self.variables.get(name(expr)?)?.direct_object()
     }
 
     fn capture(&self, expr: &Expr) -> Option<Reference> {
-        if !self.local {
-            return None;
-        }
+        let body = self.local_body?;
         match expr {
             Expr::Name(variable) => {
                 let name = variable.id.as_str();
-                let object = self.object(expr)?;
+                if !self.variables.contains_key(name) && !has_local_cell_binding(body, name) {
+                    return None;
+                }
                 Some(Reference {
-                    object,
+                    target: Referent::Cell(name.to_owned()),
                     via: Some(format!("closure capturing {name}")),
-                    cell: Some(name.to_owned()),
                 })
             }
             Expr::Attribute(node) => self.capture(&node.value),
@@ -226,9 +267,8 @@ impl<'a> Flow<'a> {
                     return Err(());
                 }
                 Ok(Some(Reference {
-                    object,
+                    target: Referent::Object(object),
                     via: Some(format!("bound method {}.{method}", instance.name)),
-                    cell: None,
                 }))
             }
             Expr::Lambda(node) if no_arguments(&node.args) => Ok(self.capture(&node.body)),
@@ -256,7 +296,7 @@ impl<'a> Flow<'a> {
         };
         let receiver = receiver_argument(&init.args)?;
         let mut constructor = Flow {
-            local: true,
+            local_body: Some(&init.body),
             ..Flow::default()
         };
         let receiver_value = constructor.new_object(binding, Kind::Instance(class));
@@ -278,22 +318,26 @@ impl<'a> Flow<'a> {
             constructor.step(statement)?;
         }
         let new = self.new_object(binding, Kind::Instance(class));
-        self.objects[new.object].shadowed_methods =
+        let id = new
+            .direct_object()
+            .expect("new instance directly references its object");
+        self.objects[id].shadowed_methods =
             std::mem::take(&mut constructor.objects[0].shadowed_methods);
-        self.edges
-            .extend(constructor.edges.into_iter().map(|mut edge| {
-                edge.owner = new.object;
-                edge.reference.object = new.object;
-                // A cell retaining the constructor receiver lives with the closure
-                // even after the constructor frame returns.
-                edge.reference.cell = None;
-                edge
-            }));
+        for mut edge in constructor.edges {
+            edge.owner = id;
+            // Constructor analysis permits only receiver attributes and does
+            // not rebind the receiver, including through a captured cell.
+            edge.reference.target = Referent::Object(id);
+            edge.event = self.event(edge.event.range);
+            self.edges.push(edge);
+        }
         Some(new)
     }
 
     fn set_variable(&mut self, name: &str, value: Option<Reference>) {
         self.classes.remove(name);
+        self.contextlib.remove(name);
+        self.int_shadowed |= name == "int";
         match value {
             Some(value) => self.variables.insert(name.to_owned(), value),
             None => self.variables.remove(name),
@@ -313,18 +357,20 @@ impl<'a> Flow<'a> {
                 let object = self.object(&node.value)?;
                 let slot = match self.objects[object].kind {
                     Kind::Dict => Slot::Key(string_constant(&node.slice)?.to_owned()),
-                    Kind::List(len) => {
-                        let i = index(&node.slice)?;
-                        if i >= len {
-                            return None;
-                        }
-                        Slot::Index(i)
-                    }
+                    Kind::List(len) => Slot::Index(list_index(&node.slice, len)?),
                     Kind::Instance(_) => return None,
                 };
                 Some((object, slot))
             }
             _ => None,
+        }
+    }
+
+    fn event(&mut self, range: TextRange) -> Event {
+        self.next_order += 1;
+        Event {
+            order: self.next_order,
+            range,
         }
     }
 
@@ -343,11 +389,12 @@ impl<'a> Flow<'a> {
         self.edges
             .retain(|edge| edge.owner != owner || edge.slot != slot);
         if let Some(reference) = value {
+            let event = self.event(range);
             self.edges.push(Edge {
                 owner,
                 slot,
                 reference,
-                range,
+                event,
             });
         }
     }
@@ -358,6 +405,10 @@ impl<'a> Flow<'a> {
                 Some(object) => Some(object),
                 None => self.value(value).ok()?,
             };
+            if self.variables.get(binding) != reference.as_ref() {
+                let event = self.event(target.range());
+                self.bindings.insert(binding.to_owned(), event);
+            }
             self.set_variable(binding, reference);
         } else {
             let (owner, slot) = self.slot(target)?;
@@ -390,6 +441,29 @@ impl<'a> Flow<'a> {
             }
         }
         Some(())
+    }
+
+    fn cleanup_slot(&self, callback: &ast::ExprAttribute) -> Option<(ObjectId, Slot)> {
+        let owner = self.object(&callback.value)?;
+        let object = &self.objects[owner];
+        let Kind::Instance(class) = object.kind else {
+            return None;
+        };
+        let method = callback.attr.as_str();
+        if object.shadowed_methods.contains(method) {
+            return None;
+        }
+        let attribute = unconditional_cleanup(class, method)?;
+        Some((owner, Slot::Attribute(attribute.to_owned())))
+    }
+
+    fn apply_cleanup(&mut self, owner: ObjectId, slot: Slot, range: TextRange) {
+        if let Slot::Attribute(attribute) = &slot {
+            self.objects[owner]
+                .shadowed_methods
+                .insert(attribute.clone());
+        }
+        self.set_edge(owner, slot, None, range);
     }
 
     fn mutation(&mut self, expr: &Expr) -> Option<()> {
@@ -429,20 +503,9 @@ impl<'a> Flow<'a> {
                 let key = string_constant(key)?;
                 self.set_edge(owner, Slot::Key(key.to_owned()), None, expr.range());
             }
-            (method, [], Kind::Instance(class)) => {
-                if self.objects[owner].shadowed_methods.contains(method) {
-                    return None;
-                }
-                let attribute = unconditional_cleanup(class, method)?;
-                self.set_edge(
-                    owner,
-                    Slot::Attribute(attribute.to_owned()),
-                    None,
-                    expr.range(),
-                );
-                self.objects[owner]
-                    .shadowed_methods
-                    .insert(attribute.to_owned());
+            (_, [], Kind::Instance(_)) => {
+                let (owner, slot) = self.cleanup_slot(method)?;
+                self.apply_cleanup(owner, slot, expr.range());
             }
             _ => return None,
         }
@@ -470,15 +533,31 @@ impl<'a> Flow<'a> {
         self.edges.clear();
         self.variables.clear();
         self.objects.clear();
+        self.bindings.clear();
+        self.next_order = 0;
     }
 
-    fn effective(&self, edge: &Edge) -> bool {
-        edge.reference.cell.as_ref().is_none_or(|cell| {
-            self.variables
-                .get(cell)
-                .is_some_and(|value| value.object == edge.reference.object && value.via.is_none())
-        })
+    fn resolve(&self, edge: &Edge) -> Option<(ObjectId, Event)> {
+        match &edge.reference.target {
+            Referent::Object(id) => Some((*id, edge.event)),
+            Referent::Cell(cell) => {
+                let target = self.variables.get(cell)?.direct_object()?;
+                let latest = self
+                    .bindings
+                    .get(cell)
+                    .copied()
+                    .filter(|binding| binding.order > edge.event.order)
+                    .unwrap_or(edge.event);
+                Some((target, latest))
+            }
+        }
     }
+}
+
+struct ResolvedEdge<'a> {
+    edge: &'a Edge,
+    target: ObjectId,
+    event: Event,
 }
 
 struct Analysis<'a> {
@@ -486,6 +565,7 @@ struct Analysis<'a> {
     source: &'a str,
     path: &'a str,
     diagnostics: Vec<Diagnostic>,
+    opt_in_fixes: bool,
 }
 
 impl<'a> Analysis<'a> {
@@ -511,66 +591,93 @@ impl<'a> Analysis<'a> {
                         false,
                     );
                     if plain {
+                        flow.set_variable(class.name.as_str(), None);
                         flow.classes.insert(class.name.to_string(), class);
-                        flow.variables.remove(class.name.as_str());
                     } else {
                         self.barrier(&mut flow);
                     }
                 }
                 Stmt::FunctionDef(function) => {
-                    let mut classes = flow.classes.clone();
-                    classes.retain(|name, _| !body_binds(&body[i + 1..], name));
-                    self.function(&function.body, &function.args, &classes, true);
-                    let name = function.name.as_str();
-                    if function.decorator_list.is_empty() && no_arguments(&function.args) {
-                        let reference =
-                            return_value(&function.body).and_then(|expr| flow.capture(expr));
-                        flow.set_variable(name, reference);
+                    self.function(
+                        &function.body,
+                        &function.args,
+                        &flow,
+                        &body[i + 1..],
+                        function.decorator_list.is_empty(),
+                    );
+                    if function.decorator_list.is_empty()
+                        && inert_signature(&function.args, function.returns.as_deref())
+                        && function.type_params.is_empty()
+                    {
+                        let reference = if no_arguments(&function.args) {
+                            return_value(&function.body).and_then(|expr| flow.capture(expr))
+                        } else {
+                            None
+                        };
+                        flow.set_variable(function.name.as_str(), reference);
                     } else {
                         self.barrier(&mut flow);
                     }
                 }
                 Stmt::AsyncFunctionDef(function) => {
-                    let mut classes = flow.classes.clone();
-                    classes.retain(|name, _| !body_binds(&body[i + 1..], name));
-                    self.function(&function.body, &function.args, &classes, false);
+                    self.function(&function.body, &function.args, &flow, &body[i + 1..], false);
                     self.barrier(&mut flow);
                 }
                 Stmt::Import(node) => {
+                    if !flow.objects.is_empty() {
+                        self.barrier(&mut flow);
+                    }
                     for alias in &node.names {
                         let binding = alias.asname.as_ref().map_or_else(
                             || alias.name.as_str().split('.').next().unwrap(),
                             |name| name.as_str(),
                         );
                         flow.set_variable(binding, None);
-                    }
-                    if !flow.objects.is_empty() {
-                        self.barrier(&mut flow);
+                        if alias.name.as_str() == "contextlib" {
+                            flow.contextlib
+                                .insert(binding.to_owned(), ContextlibBinding::Module);
+                        }
                     }
                 }
                 Stmt::ImportFrom(node) => {
-                    for alias in &node.names {
-                        flow.set_variable(
-                            alias.asname.as_ref().unwrap_or(&alias.name).as_str(),
-                            None,
-                        );
-                    }
                     if !flow.objects.is_empty()
                         || node.names.iter().any(|alias| alias.name.as_str() == "*")
                     {
                         self.barrier(&mut flow);
                     }
+                    let from_contextlib = node.level.is_none_or(|level| level.to_usize() == 0)
+                        && node
+                            .module
+                            .as_ref()
+                            .is_some_and(|name| name.as_str() == "contextlib");
+                    for alias in &node.names {
+                        let binding = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                        flow.set_variable(binding, None);
+                        if from_contextlib && alias.name.as_str() == "ExitStack" {
+                            flow.contextlib
+                                .insert(binding.to_owned(), ContextlibBinding::ExitStack);
+                        }
+                    }
                 }
-                Stmt::Try(node) if node.handlers.is_empty() && node.orelse.is_empty() => {
+                Stmt::Try(node) if !node.finalbody.is_empty() => {
                     if let Some(returns) = try_with_cleanup(&mut flow, node) {
                         if returns {
                             break;
                         }
                     } else {
-                        // There may be a cleanup we cannot prove. Do not report
-                        // a cycle based on a snapshot taken before that cleanup.
-                        flow.clear_objects();
-                        flow.classes.clear();
+                        self.barrier(&mut flow);
+                    }
+                }
+                Stmt::With(node) => {
+                    if let Some(returns) = with_exit_stack(&mut flow, node) {
+                        if returns {
+                            break;
+                        }
+                    } else {
+                        let mut branch = flow.clone();
+                        self.barrier(&mut flow);
+                        branch.clear_objects();
+                        self.suite(&node.body, branch, false);
                     }
                 }
                 Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => break,
@@ -587,7 +694,9 @@ impl<'a> Analysis<'a> {
                                 branch,
                                 Flow {
                                     classes: flow.classes.clone(),
-                                    local: flow.local,
+                                    contextlib: flow.contextlib.clone(),
+                                    int_shadowed: flow.int_shadowed,
+                                    local_body: flow.local_body,
                                     ..Flow::default()
                                 },
                                 false,
@@ -595,6 +704,8 @@ impl<'a> Analysis<'a> {
                         }
                         flow.clear_objects();
                         flow.classes.clear();
+                        flow.contextlib.clear();
+                        flow.int_shadowed = true;
                     }
                 }
             }
@@ -606,14 +717,14 @@ impl<'a> Analysis<'a> {
         &mut self,
         body: &'a [Stmt],
         arguments: &ast::Arguments,
-        classes: &HashMap<String, &'a ast::StmtClassDef>,
+        enclosing: &Flow<'a>,
+        following: &[Stmt],
         normal: bool,
     ) {
         if has_nonlocal_declaration(body) {
             return;
         }
-        let mut known = classes.clone();
-        for parameter in arguments
+        let parameters: HashSet<_> = arguments
             .posonlyargs
             .iter()
             .chain(&arguments.args)
@@ -621,15 +732,22 @@ impl<'a> Analysis<'a> {
             .map(|parameter| &parameter.def)
             .chain(arguments.vararg.as_deref())
             .chain(arguments.kwarg.as_deref())
-        {
-            known.remove(parameter.arg.as_str());
-        }
-        known.retain(|name, _| !body_binds(body, name));
+            .map(|parameter| parameter.arg.as_str())
+            .collect();
+        let unshadowed = |name: &str| {
+            !parameters.contains(name) && !body_binds(body, name) && !body_binds(following, name)
+        };
+        let mut classes = enclosing.classes.clone();
+        classes.retain(|name, _| unshadowed(name));
+        let mut contextlib = enclosing.contextlib.clone();
+        contextlib.retain(|name, _| unshadowed(name));
         self.suite(
             body,
             Flow {
-                classes: known,
-                local: true,
+                classes,
+                contextlib,
+                int_shadowed: enclosing.int_shadowed || !unshadowed("int"),
+                local_body: Some(body),
                 ..Flow::default()
             },
             normal && no_arguments(arguments),
@@ -640,18 +758,33 @@ impl<'a> Analysis<'a> {
         self.report_cycles(flow, None);
         flow.clear_objects();
         flow.classes.clear();
+        flow.contextlib.clear();
+        flow.int_shadowed = true;
     }
 
     fn report_cycles(&mut self, flow: &Flow<'_>, fix: Option<&(TextRange, Fix)>) {
         if flow.edges.is_empty() {
             return;
         }
+        let mut resolved: Vec<_> = flow
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let (target, event) = flow.resolve(edge)?;
+                Some(ResolvedEdge {
+                    edge,
+                    target,
+                    event,
+                })
+            })
+            .collect();
+        resolved.sort_by_key(|edge| edge.event.order);
         let mut earlier = vec![Vec::new(); flow.objects.len()];
-        for edge in flow.edges.iter().filter(|edge| flow.effective(edge)) {
-            if let Some(path) = find_path(&earlier, edge.reference.object, edge.owner) {
+        for edge in &resolved {
+            if let Some(path) = find_path(&earlier, edge.target, edge.edge.owner) {
                 let mut chain = Vec::new();
                 let mut retained = Vec::new();
-                for part in std::iter::once(edge).chain(path) {
+                for part in std::iter::once(edge).chain(path).map(|part| part.edge) {
                     let holder = &flow.objects[part.owner].name;
                     if !retained.contains(&holder.as_str()) {
                         retained.push(holder.as_str());
@@ -661,10 +794,10 @@ impl<'a> Analysis<'a> {
                         chain.push(via.clone());
                     }
                 }
-                chain.push(flow.objects[edge.owner].name.clone());
-                let start = self.position(edge.range.start().into());
-                let end = self.position(edge.range.end().into());
-                let proven_local = fix.is_some_and(|(range, _)| *range == edge.range);
+                chain.push(flow.objects[edge.edge.owner].name.clone());
+                let start = self.position(edge.event.range.start().into());
+                let end = self.position(edge.event.range.end().into());
+                let proven_local = fix.is_some_and(|(range, _)| *range == edge.event.range);
                 let effects = if proven_local {
                     "This isolated local container remains in the cycle after return until cyclic GC runs."
                 } else {
@@ -682,13 +815,13 @@ impl<'a> Analysis<'a> {
                     "warning",
                 );
                 if let Some((range, fix)) = fix {
-                    if *range == edge.range {
+                    if self.opt_in_fixes && *range == edge.event.range {
                         diagnostic = diagnostic.with_fix(fix.clone());
                     }
                 }
                 self.diagnostics.push(diagnostic);
             }
-            earlier[edge.owner].push(edge);
+            earlier[edge.edge.owner].push(edge);
         }
     }
 
@@ -699,10 +832,10 @@ impl<'a> Analysis<'a> {
 }
 
 fn find_path<'a>(
-    earlier: &[Vec<&'a Edge>],
+    earlier: &[Vec<&'a ResolvedEdge<'a>>],
     start: ObjectId,
     goal: ObjectId,
-) -> Option<Vec<&'a Edge>> {
+) -> Option<Vec<&'a ResolvedEdge<'a>>> {
     if start == goal {
         return Some(Vec::new());
     }
@@ -713,7 +846,7 @@ fn find_path<'a>(
     let mut parents = HashMap::new();
     while let Some(vertex) = pending.pop() {
         for edge in &earlier[vertex] {
-            let next = edge.reference.object;
+            let next = edge.target;
             if next == start || parents.contains_key(&next) {
                 continue;
             }
@@ -722,9 +855,9 @@ fn find_path<'a>(
                 let mut path = Vec::new();
                 let mut at = goal;
                 while at != start {
-                    let edge: &Edge = parents[&at];
+                    let edge: &ResolvedEdge<'_> = parents[&at];
                     path.push(edge);
-                    at = edge.owner;
+                    at = edge.edge.owner;
                 }
                 path.reverse();
                 return Some(path);
@@ -735,18 +868,186 @@ fn find_path<'a>(
     None
 }
 
-fn try_with_cleanup<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtTry) -> Option<bool> {
-    let (body, returns) = match node.body.split_last() {
-        Some((Stmt::Return(ret), body))
-            if ret.value.as_deref().is_none_or(|v| name(v).is_some()) =>
+fn inert_signature(args: &ast::Arguments, returns: Option<&Expr>) -> bool {
+    returns.is_none()
+        && args
+            .posonlyargs
+            .iter()
+            .chain(&args.args)
+            .chain(&args.kwonlyargs)
+            .all(|arg| arg.default.is_none() && arg.def.annotation.is_none())
+        && args
+            .vararg
+            .as_deref()
+            .is_none_or(|arg| arg.annotation.is_none())
+        && args
+            .kwarg
+            .as_deref()
+            .is_none_or(|arg| arg.annotation.is_none())
+}
+
+fn terminal_return(body: &[Stmt]) -> (&[Stmt], bool) {
+    match body.split_last() {
+        Some((Stmt::Return(ret), rest))
+            if ret.value.as_deref().is_none_or(|value| {
+                name(value).is_some() || matches!(value, Expr::Constant(_))
+            }) =>
         {
-            (body, true)
+            (rest, true)
         }
-        _ => (node.body.as_slice(), false),
+        _ => (body, false),
+    }
+}
+
+fn expression_call(statement: &Stmt) -> Option<&ast::ExprCall> {
+    let Stmt::Expr(expr) = statement else {
+        return None;
     };
+    if let Expr::Call(call) = expr.value.as_ref() {
+        Some(call)
+    } else {
+        None
+    }
+}
+
+fn try_with_cleanup<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtTry) -> Option<bool> {
+    // Exception handlers may run before the modeled mutations have taken
+    // effect. An inert handler preserves the binding and pending cleanup.
+    if node.handlers.iter().any(|handler| {
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+        handler.name.is_some()
+            || !handler
+                .body
+                .iter()
+                .all(|stmt| matches!(stmt, Stmt::Pass(_)))
+    }) {
+        return None;
+    }
+    let (body, returns) = terminal_return(&node.body);
     let mut trial = flow.clone();
-    for statement in body.iter().chain(&node.finalbody) {
-        trial.step(statement)?;
+    let orelse = if returns {
+        &[][..]
+    } else {
+        node.orelse.as_slice()
+    };
+    for statement in body.iter().chain(orelse) {
+        if trial.step(statement).is_some() {
+            continue;
+        }
+        // Recognize the pure no-argument built-in used in the protected
+        // region. An opaque call is a barrier and keeps the last proven graph.
+        let pure = expression_call(statement).is_some_and(|call| {
+            let arguments_empty = call.args.is_empty() && call.keywords.is_empty();
+            let known_builtin = !trial.int_shadowed && name(&call.func) == Some("int");
+            let local_clear =
+                name(&call.func).is_some() && clears_isolated_container(&trial, &node.finalbody);
+            arguments_empty && (known_builtin || local_clear)
+        });
+        if !pure {
+            *flow = trial;
+            return None;
+        }
+    }
+    // Cancel a report only once the entire cleanup has been proven.
+    let mut final_state = trial.clone();
+    for statement in &node.finalbody {
+        if final_state.step(statement).is_none() {
+            *flow = trial;
+            return None;
+        }
+    }
+    *flow = final_state;
+    Some(returns)
+}
+
+fn clears_isolated_container(flow: &Flow<'_>, finally: &[Stmt]) -> bool {
+    let Some(local_body) = flow.local_body else {
+        return false;
+    };
+    if has_nested_scope(local_body) {
+        // A callee declared here may rebind one of our closure cells.
+        return false;
+    }
+    let [statement] = finally else {
+        return false;
+    };
+    let Some(call) = expression_call(statement) else {
+        return false;
+    };
+    let Expr::Attribute(method) = call.func.as_ref() else {
+        return false;
+    };
+    method.attr.as_str() == "clear"
+        && call.args.is_empty()
+        && call.keywords.is_empty()
+        && flow
+            .object(&method.value)
+            .is_some_and(|object| matches!(flow.objects[object].kind, Kind::List(_) | Kind::Dict))
+}
+
+fn has_nested_scope(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| {
+        matches!(
+            stmt,
+            Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_) | Stmt::ClassDef(_)
+        ) || try_and_blocks(stmt).into_iter().any(has_nested_scope)
+    })
+}
+
+fn with_exit_stack<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtWith) -> Option<bool> {
+    let [item] = node.items.as_slice() else {
+        return None;
+    };
+    let Expr::Call(constructor) = &item.context_expr else {
+        return None;
+    };
+    let is_contextlib = match constructor.func.as_ref() {
+        Expr::Name(node) => {
+            flow.contextlib.get(node.id.as_str()) == Some(&ContextlibBinding::ExitStack)
+        }
+        Expr::Attribute(node) => {
+            node.attr.as_str() == "ExitStack"
+                && name(&node.value).and_then(|name| flow.contextlib.get(name))
+                    == Some(&ContextlibBinding::Module)
+        }
+        _ => false,
+    };
+    if !is_contextlib || !constructor.args.is_empty() || !constructor.keywords.is_empty() {
+        return None;
+    }
+    let stack = name(item.optional_vars.as_deref()?)?;
+    if body_binds(&node.body, stack) {
+        return None;
+    }
+    let (body, returns) = terminal_return(&node.body);
+    let mut trial = flow.clone();
+    trial.set_variable(stack, None);
+    let mut pending = Vec::new();
+    for statement in body {
+        let registration = expression_call(statement).and_then(|call| {
+            let Expr::Attribute(function) = call.func.as_ref() else {
+                return None;
+            };
+            let [Expr::Attribute(callback)] = call.args.as_slice() else {
+                return None;
+            };
+            if name(&function.value) != Some(stack)
+                || function.attr.as_str() != "callback"
+                || !call.keywords.is_empty()
+            {
+                return None;
+            }
+            let (owner, slot) = trial.cleanup_slot(callback)?;
+            Some((owner, slot, call.range()))
+        });
+        if let Some(release) = registration {
+            pending.push(release);
+        } else {
+            trial.step(statement)?;
+        }
+    }
+    for (owner, slot, range) in pending.into_iter().rev() {
+        trial.apply_cleanup(owner, slot, range);
     }
     *flow = trial;
     Some(returns)
@@ -807,13 +1108,38 @@ fn binds(target: &Expr, wanted: &str) -> bool {
     }
 }
 
+fn has_local_cell_binding(body: &[Stmt], wanted: &str) -> bool {
+    body.iter().any(|statement| {
+        let assigned = match statement {
+            Stmt::Assign(node) => node.targets.iter().any(|target| binds(target, wanted)),
+            Stmt::AnnAssign(node) => binds(&node.target, wanted),
+            _ => false,
+        };
+        assigned
+            || try_and_blocks(statement)
+                .into_iter()
+                .any(|suite| has_local_cell_binding(suite, wanted))
+    })
+}
+
+fn affects_binding(target: &Expr, wanted: &str) -> bool {
+    binds(target, wanted)
+        || matches!(target, Expr::Attribute(node) if name(&node.value) == Some(wanted))
+}
+
 fn body_binds(body: &[Stmt], wanted: &str) -> bool {
     body.iter().any(|statement| {
         let binding = match statement {
-            Stmt::Assign(node) => node.targets.iter().any(|target| binds(target, wanted)),
-            Stmt::AnnAssign(node) => binds(&node.target, wanted),
-            Stmt::AugAssign(node) => binds(&node.target, wanted),
-            Stmt::Delete(node) => node.targets.iter().any(|target| binds(target, wanted)),
+            Stmt::Assign(node) => node
+                .targets
+                .iter()
+                .any(|target| affects_binding(target, wanted)),
+            Stmt::AnnAssign(node) => affects_binding(&node.target, wanted),
+            Stmt::AugAssign(node) => affects_binding(&node.target, wanted),
+            Stmt::Delete(node) => node
+                .targets
+                .iter()
+                .any(|target| affects_binding(target, wanted)),
             Stmt::ClassDef(node) => node.name.as_str() == wanted,
             Stmt::FunctionDef(node) => node.name.as_str() == wanted,
             Stmt::AsyncFunctionDef(node) => node.name.as_str() == wanted,
@@ -827,18 +1153,18 @@ fn body_binds(body: &[Stmt], wanted: &str) -> bool {
                 alias.asname.as_ref().unwrap_or(&alias.name).as_str() == wanted
                     || alias.name.as_str() == "*"
             }),
-            Stmt::For(node) => binds(&node.target, wanted),
-            Stmt::AsyncFor(node) => binds(&node.target, wanted),
+            Stmt::For(node) => affects_binding(&node.target, wanted),
+            Stmt::AsyncFor(node) => affects_binding(&node.target, wanted),
             Stmt::With(node) => node
                 .items
                 .iter()
                 .filter_map(|item| item.optional_vars.as_deref())
-                .any(|target| binds(target, wanted)),
+                .any(|target| affects_binding(target, wanted)),
             Stmt::AsyncWith(node) => node
                 .items
                 .iter()
                 .filter_map(|item| item.optional_vars.as_deref())
-                .any(|target| binds(target, wanted)),
+                .any(|target| affects_binding(target, wanted)),
             Stmt::Try(node) => handler_binds(&node.handlers, wanted),
             Stmt::TryStar(node) => handler_binds(&node.handlers, wanted),
             // Pattern captures may shadow inherited classes.
@@ -1183,6 +1509,129 @@ def alternative_branches(flag):
     }
 
     #[test]
+    fn known_negative_index_deletion_removes_the_cycle() {
+        let source = "def f():\n    ring = []\n    ring.append(ring)\n    del ring[-1]\n";
+        assert!(warnings(source).is_empty());
+        assert_eq!(warnings(&source.replace("[-1]", "[-2]")).len(), 1);
+    }
+
+    #[test]
+    fn finally_cleanup_is_proven_with_an_inert_handler() {
+        let source = r#"class Owner:
+    def close(self):
+        self.link = None
+
+def clean_list():
+    ring = []
+    ring.append(ring)
+    try:
+        int()
+    except ValueError:
+        pass
+    finally:
+        ring.clear()
+
+def clean_instance():
+    owner = Owner()
+    owner.link = owner
+    try:
+        int()
+    except ValueError:
+        pass
+    finally:
+        owner.close()
+"#;
+        assert!(warnings(source).is_empty());
+        assert!(warnings("def f():\n    ring = []\n    ring.append(ring)\n    try:\n        opaque()\n    finally:\n        ring.clear()\n").is_empty());
+        let shadowed = source.replace("    try:\n        int()\n    except ValueError:\n        pass\n    finally:\n        owner.close()", "    owner.close = replacement\n    try:\n        int()\n    except ValueError:\n        pass\n    finally:\n        owner.close()");
+        assert_eq!(warnings(&shadowed).len(), 1);
+    }
+
+    #[test]
+    fn retains_the_last_proven_graph_when_finally_does_nothing() {
+        let source = r#"def f():
+    ring = []
+    try:
+        ring.append(ring)
+        opaque()
+    finally:
+        pass
+"#;
+        let found = warnings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].line, found[0].column), (4, 21));
+    }
+
+    #[test]
+    fn recognizes_only_proven_registered_exit_stack_cleanup() {
+        let source = r#"from contextlib import ExitStack as Stack
+
+class Owner:
+    def close(self):
+        self.link = None
+
+def managed():
+    owner = Owner()
+    owner.link = owner
+    with Stack() as stack:
+        stack.callback(owner.close)
+        return owner
+"#;
+        assert!(warnings(source).is_empty());
+        assert!(warnings(
+            &source
+                .replace(
+                    "from contextlib import ExitStack as Stack",
+                    "import contextlib as ctx"
+                )
+                .replace("with Stack()", "with ctx.ExitStack()")
+        )
+        .is_empty());
+        for shadowed in [
+            source.replace("def managed():", "def managed(Stack):"),
+            source.replace(
+                "    with Stack() as stack:",
+                "    Stack = replacement\n    with Stack() as stack:",
+            ),
+            source.replace(
+                "    with Stack() as stack:",
+                "    owner.close = replacement\n    with Stack() as stack:",
+            ),
+            source.replace(
+                "        return owner",
+                "        stack.pop_all()\n        return owner",
+            ),
+            source.replace(
+                "        stack.callback(owner.close)",
+                "        stack.callback = replacement\n        stack.callback(owner.close)",
+            ),
+        ] {
+            assert_eq!(warnings(&shadowed).len(), 1, "{shadowed}");
+        }
+    }
+
+    #[test]
+    fn rebinding_a_captured_cell_can_close_and_break_a_cycle() {
+        let source = r#"def f():
+    ring = []
+    ring.append(lambda: current)
+    current = ring
+    return ring
+"#;
+        let found = warnings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].line, found[0].column, found[0].end_column),
+            (4, 5, 12)
+        );
+        assert!(found[0]
+            .message
+            .contains("ring[0] → closure capturing current → ring"));
+        let broken = source.replace("    return ring", "    current = None\n    return ring");
+        assert!(warnings(&broken).is_empty());
+    }
+
+    #[test]
     fn supplies_an_idempotent_fix_only_for_unobserved_builtin_local_containers() {
         let source = r#"def list_case():
     ring = []
@@ -1198,10 +1647,35 @@ def dict_case():
         let found = warnings(source);
         assert_eq!(found.len(), 2);
         assert_eq!((found[0].line, found[0].column), (3, 17));
-        assert!(found
+        assert!(found.iter().all(|d| d.fix.is_none()));
+        let dir =
+            std::env::temp_dir().join(format!("sklint-cycle-fix-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("reference_cycle_fixture.py");
+        let pyproject = dir.join("pyproject.toml");
+        let default = format_source(path.clone(), source.to_owned(), config(true));
+        assert!(default.source.contains("ring.append(ring)"));
+        assert!(default.source.contains("values[\"loop\"] = values"));
+
+        std::fs::write(
+            &pyproject,
+            "[tool.sklint]\nstrict = true\nstrong-cycle-fixes = true\n",
+        )
+        .unwrap();
+        let report = analyze(AnalysisInput {
+            path: path.clone(),
+            source: source.to_owned(),
+            vscode_config: config(true),
+        });
+        let fixes: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "SK512")
+            .collect();
+        assert_eq!(fixes.len(), 2);
+        assert!(fixes
             .iter()
             .all(|d| d.fix.as_ref().is_some_and(|fix| fix.safe)));
-        let path = PathBuf::from("reference_cycle_fixture.py");
         let formatted = format_source(path.clone(), source.to_owned(), config(true));
         assert!(formatted.applied >= 2);
         assert_eq!(formatted.remaining_safe, 0);
@@ -1213,6 +1687,8 @@ def dict_case():
         assert_eq!(second.applied, 0);
         assert_eq!(second.source, formatted.source);
         assert!(warnings(&second.source).is_empty());
+        std::fs::remove_file(pyproject).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

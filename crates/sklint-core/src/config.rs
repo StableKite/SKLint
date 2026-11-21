@@ -49,6 +49,7 @@ pub struct VscodeConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PyProjectConfig {
+    pub strong_cycle_fixes: bool,
     pub found_path: Option<PathBuf>,
     pub has_sklint_section: bool,
     pub strict: Option<bool>,
@@ -81,6 +82,7 @@ pub struct FileInlineConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
+    pub strong_cycle_fixes: bool,
     pub strict: bool,
     pub select: Vec<String>,
     pub ignore: Vec<String>,
@@ -155,6 +157,7 @@ impl EffectiveConfig {
         let active_codes = active_codes(strict, &select, &ignore);
         Self {
             strict,
+            strong_cycle_fixes: pyproject.strong_cycle_fixes,
             select,
             ignore,
             active_codes,
@@ -305,6 +308,12 @@ pub fn parse_pyproject_toml(text: &str) -> PyProjectConfig {
                     Err(message) => config
                         .errors
                         .push(format!("[tool.sklint] ignore {message}")),
+                },
+                "strong-cycle-fixes" => match parse_bool(value) {
+                    Some(parsed) => config.strong_cycle_fixes = parsed,
+                    None => config.errors.push(format!(
+                        "[tool.sklint] {key} must be a TOML boolean, got `{value}`"
+                    )),
                 },
                 "assertion_helpers" | "assertion-helpers" => {
                     match parse_string_array_preserving_case(value) {
