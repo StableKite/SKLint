@@ -810,7 +810,7 @@ impl<'a> Analysis<'a> {
                 let mut diagnostic = Diagnostic::new(
                     "SK512",
                     format!(
-                        "Strong reference cycle: {}. Retained: {}. {effects} Clear the stored reference during cleanup.",
+                        "Strong reference cycle: {}. Retained: {}. {effects} Remove the back reference, pass the object at call time, or clear the stored reference during explicit cleanup (close, unsubscribe, or finally).",
                         chain.join(" → "),
                         retained.join(", "),
                     ),

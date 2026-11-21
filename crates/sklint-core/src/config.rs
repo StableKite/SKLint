@@ -206,7 +206,7 @@ fn active_codes(strict: bool, select: &[String], ignore: &[String]) -> Vec<Strin
     }
 
     enabled.retain(|code| {
-        (strict || !matches!(code.as_str(), "SK511" | "SK512"))
+        (strict || !matches!(code.as_str(), "SK511" | "SK512" | "SK513"))
             && !ignore
                 .iter()
                 .any(|selector| code_matches_selector(code, selector))

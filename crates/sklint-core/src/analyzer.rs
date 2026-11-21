@@ -523,6 +523,9 @@ fn run_rules(path: &Path, source: &str, config: &EffectiveConfig) -> Vec<Diagnos
             if config.is_enabled("SK512") {
                 diagnostics.extend(crate::strong_cycles::check(&ast, source, &display_path, config.strong_cycle_fixes));
             }
+            if config.is_enabled("SK513") {
+                diagnostics.extend(crate::weak_references::check(&ast, source, &display_path));
+            }
             if config.is_enabled("SK511") {
                 diagnostics.extend(crate::lazy_imports::check(ast, source, &display_path));
             }

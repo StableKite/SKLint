@@ -202,6 +202,12 @@ pub const ALL_RULES: &[Rule] = &[
         summary: "Detect proven strong reference cycles with no proven cleanup",
     },
     Rule {
+        code: "SK513",
+        name: "WeakReferencesForbidden",
+        level: RuleLevel::Strict,
+        summary: "Weak references and explicit weak-reference slots are forbidden in strict mode",
+    },
+    Rule {
         code: "SK507",
         name: "RaiseHotPath",
         level: RuleLevel::Normal,

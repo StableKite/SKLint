@@ -18,6 +18,7 @@ mod exception_values;
 pub mod formatter;
 mod identifier;
 mod lazy_imports;
+mod lexical_bindings;
 pub mod magic_constants;
 #[cfg(test)]
 mod pep758_tests;
@@ -29,6 +30,7 @@ pub mod rules;
 mod strong_cycles;
 pub mod suppression;
 pub mod syntax_rules;
+mod weak_references;
 
 pub use analyzer::{analyze, AnalysisInput, AnalysisReport};
 pub use config::{
