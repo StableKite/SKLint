@@ -734,19 +734,23 @@ impl<'a> Analysis<'a> {
             .chain(arguments.kwarg.as_deref())
             .map(|parameter| parameter.arg.as_str())
             .collect();
-        let unshadowed = |name: &str| {
-            !parameters.contains(name) && !body_binds(body, name) && !body_binds(following, name)
+        let unshadowed = |name: &str, target_binds| {
+            !parameters.contains(name)
+                && !body_binds(body, name, target_binds)
+                && !body_binds(following, name, affects_binding)
         };
         let mut classes = enclosing.classes.clone();
-        classes.retain(|name, _| unshadowed(name));
+        // An attribute write does not make a class name local. Encountering
+        // the write later invalidates the flow, after reporting existing cycles.
+        classes.retain(|name, _| unshadowed(name, binds));
         let mut contextlib = enclosing.contextlib.clone();
-        contextlib.retain(|name, _| unshadowed(name));
+        contextlib.retain(|name, _| unshadowed(name, affects_binding));
         self.suite(
             body,
             Flow {
                 classes,
                 contextlib,
-                int_shadowed: enclosing.int_shadowed || !unshadowed("int"),
+                int_shadowed: enclosing.int_shadowed || !unshadowed("int", affects_binding),
                 local_body: Some(body),
                 ..Flow::default()
             },
@@ -916,6 +920,11 @@ fn try_with_cleanup<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtTry) -> Option<b
     if node.handlers.iter().any(|handler| {
         let ast::ExceptHandler::ExceptHandler(handler) = handler;
         handler.name.is_some()
+            || handler.type_.as_deref().is_some_and(|expr| match expr {
+                Expr::Name(_) => false,
+                Expr::Tuple(tuple) => tuple.elts.iter().any(|item| name(item).is_none()),
+                _ => true,
+            })
             || !handler
                 .body
                 .iter()
@@ -930,20 +939,25 @@ fn try_with_cleanup<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtTry) -> Option<b
     } else {
         node.orelse.as_slice()
     };
-    for statement in body.iter().chain(orelse) {
+    for (index, statement) in body.iter().chain(orelse).enumerate() {
         if trial.step(statement).is_some() {
             continue;
         }
-        // Recognize the pure no-argument built-in used in the protected
-        // region. An opaque call is a barrier and keeps the last proven graph.
-        let pure = expression_call(statement).is_some_and(|call| {
-            let arguments_empty = call.args.is_empty() && call.keywords.is_empty();
+        let preserves_flow = expression_call(statement).is_some_and(|call| {
+            if !call.args.is_empty() || !call.keywords.is_empty() {
+                return false;
+            }
             let known_builtin = !trial.int_shadowed && name(&call.func) == Some("int");
-            let local_clear =
-                name(&call.func).is_some() && clears_isolated_container(&trial, &node.finalbody);
-            arguments_empty && (known_builtin || local_clear)
+            // An opaque call may raise, skipping later work in the try suite.
+            // Only the finalizer can be counted on after a terminal call.
+            let goes_directly_to_finally = index + 1 == body.len()
+                && orelse.is_empty()
+                && (!returns || node.handlers.is_empty());
+            known_builtin
+                || (goes_directly_to_finally
+                    && opaque_call_preserves_cleanup(&trial, &call.func, &node.finalbody))
         });
-        if !pure {
+        if !preserves_flow {
             *flow = trial;
             return None;
         }
@@ -960,12 +974,13 @@ fn try_with_cleanup<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtTry) -> Option<b
     Some(returns)
 }
 
-fn clears_isolated_container(flow: &Flow<'_>, finally: &[Stmt]) -> bool {
-    let Some(local_body) = flow.local_body else {
+fn opaque_call_preserves_cleanup(flow: &Flow<'_>, callee: &Expr, finally: &[Stmt]) -> bool {
+    let (Some(local_body), Some(callee)) = (flow.local_body, name(callee)) else {
         return false;
     };
-    if has_nested_scope(local_body) {
-        // A callee declared here may rebind one of our closure cells.
+    // A nested function can rebind the local cell. A locally rebound callee
+    // could also be a lambda that closes over the object, including via an alias.
+    if has_nested_scope(local_body) || body_binds(local_body, callee, binds) {
         return false;
     }
     let [statement] = finally else {
@@ -977,12 +992,14 @@ fn clears_isolated_container(flow: &Flow<'_>, finally: &[Stmt]) -> bool {
     let Expr::Attribute(method) = call.func.as_ref() else {
         return false;
     };
-    method.attr.as_str() == "clear"
-        && call.args.is_empty()
-        && call.keywords.is_empty()
-        && flow
-            .object(&method.value)
-            .is_some_and(|object| matches!(flow.objects[object].kind, Kind::List(_) | Kind::Dict))
+    if !call.args.is_empty() || !call.keywords.is_empty() {
+        return false;
+    }
+    flow.object(&method.value)
+        .is_some_and(|object| match flow.objects[object].kind {
+            Kind::List(_) | Kind::Dict => method.attr.as_str() == "clear",
+            Kind::Instance(_) => flow.cleanup_slot(method).is_some(),
+        })
 }
 
 fn has_nested_scope(body: &[Stmt]) -> bool {
@@ -1016,7 +1033,7 @@ fn with_exit_stack<'a>(flow: &mut Flow<'a>, node: &'a ast::StmtWith) -> Option<b
         return None;
     }
     let stack = name(item.optional_vars.as_deref()?)?;
-    if body_binds(&node.body, stack) {
+    if body_binds(&node.body, stack, affects_binding) {
         return None;
     }
     let (body, returns) = terminal_return(&node.body);
@@ -1127,19 +1144,19 @@ fn affects_binding(target: &Expr, wanted: &str) -> bool {
         || matches!(target, Expr::Attribute(node) if name(&node.value) == Some(wanted))
 }
 
-fn body_binds(body: &[Stmt], wanted: &str) -> bool {
+fn body_binds(body: &[Stmt], wanted: &str, target_binds: fn(&Expr, &str) -> bool) -> bool {
     body.iter().any(|statement| {
         let binding = match statement {
             Stmt::Assign(node) => node
                 .targets
                 .iter()
-                .any(|target| affects_binding(target, wanted)),
-            Stmt::AnnAssign(node) => affects_binding(&node.target, wanted),
-            Stmt::AugAssign(node) => affects_binding(&node.target, wanted),
+                .any(|target| target_binds(target, wanted)),
+            Stmt::AnnAssign(node) => target_binds(&node.target, wanted),
+            Stmt::AugAssign(node) => target_binds(&node.target, wanted),
             Stmt::Delete(node) => node
                 .targets
                 .iter()
-                .any(|target| affects_binding(target, wanted)),
+                .any(|target| target_binds(target, wanted)),
             Stmt::ClassDef(node) => node.name.as_str() == wanted,
             Stmt::FunctionDef(node) => node.name.as_str() == wanted,
             Stmt::AsyncFunctionDef(node) => node.name.as_str() == wanted,
@@ -1153,18 +1170,18 @@ fn body_binds(body: &[Stmt], wanted: &str) -> bool {
                 alias.asname.as_ref().unwrap_or(&alias.name).as_str() == wanted
                     || alias.name.as_str() == "*"
             }),
-            Stmt::For(node) => affects_binding(&node.target, wanted),
-            Stmt::AsyncFor(node) => affects_binding(&node.target, wanted),
+            Stmt::For(node) => target_binds(&node.target, wanted),
+            Stmt::AsyncFor(node) => target_binds(&node.target, wanted),
             Stmt::With(node) => node
                 .items
                 .iter()
                 .filter_map(|item| item.optional_vars.as_deref())
-                .any(|target| affects_binding(target, wanted)),
+                .any(|target| target_binds(target, wanted)),
             Stmt::AsyncWith(node) => node
                 .items
                 .iter()
                 .filter_map(|item| item.optional_vars.as_deref())
-                .any(|target| affects_binding(target, wanted)),
+                .any(|target| target_binds(target, wanted)),
             Stmt::Try(node) => handler_binds(&node.handlers, wanted),
             Stmt::TryStar(node) => handler_binds(&node.handlers, wanted),
             // Pattern captures may shadow inherited classes.
@@ -1174,7 +1191,7 @@ fn body_binds(body: &[Stmt], wanted: &str) -> bool {
         binding
             || try_and_blocks(statement)
                 .into_iter()
-                .any(|body| body_binds(body, wanted))
+                .any(|body| body_binds(body, wanted, target_binds))
     })
 }
 
@@ -1545,6 +1562,64 @@ def clean_instance():
         assert!(warnings("def f():\n    ring = []\n    ring.append(ring)\n    try:\n        opaque()\n    finally:\n        ring.clear()\n").is_empty());
         let shadowed = source.replace("    try:\n        int()\n    except ValueError:\n        pass\n    finally:\n        owner.close()", "    owner.close = replacement\n    try:\n        int()\n    except ValueError:\n        pass\n    finally:\n        owner.close()");
         assert_eq!(warnings(&shadowed).len(), 1);
+    }
+
+    const SELF_CALLBACK_OWNER: &str = r#"class Owner:
+    def __init__(self):
+        self.callback = self.handle
+
+    def handle(self):
+        pass
+
+    def close(self):
+        self.callback = None
+
+"#;
+
+    #[test]
+    fn releases_a_private_instance_after_an_opaque_call() {
+        for handler in ["", "    except ValueError:\n        pass\n"] {
+            let source = format!(
+                "{SELF_CALLBACK_OWNER}def f(work):\n    owner = Owner()\n    try:\n        work()\n{handler}    finally:\n        owner.close()\n"
+            );
+            assert!(warnings(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn opaque_work_preserves_cycles_when_cleanup_is_unproven() {
+        for (setup, work, cleanup) in [
+            ("", "work(owner)", "owner.close()"),
+            ("", "work(owner=owner)", "owner.close()"),
+            ("", "work()", "pass"),
+            ("    owner.close = owner.handle\n", "work()", "owner.close()"),
+            ("", "owner = Owner()", "owner.close()"),
+            ("", "Owner.close = Owner.handle", "owner.close()"),
+            (
+                "    def work():\n        nonlocal owner\n        owner = Owner()\n",
+                "work()",
+                "owner.close()",
+            ),
+            (
+                "    replacement = lambda: setattr(owner, 'close', owner.handle)\n    work = replacement\n",
+                "work()",
+                "owner.close()",
+            ),
+            (
+                "    other = Owner()\n",
+                "work()\n        other.close()",
+                "owner.close()",
+            ),
+        ] {
+            let source = format!(
+                "{SELF_CALLBACK_OWNER}def f(work):\n    owner = Owner()\n{setup}    try:\n        {work}\n    finally:\n        {cleanup}\n"
+            );
+            let found = warnings(&source);
+            assert!(
+                found.iter().any(|entry| (entry.line, entry.column) == (3, 25)),
+                "{source}\n{found:?}"
+            );
+        }
     }
 
     #[test]
